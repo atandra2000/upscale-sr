@@ -1,0 +1,118 @@
+# Upscale-SR — 4× real-world photo super-resolution
+# Hardware: 2× RTX 5090 32 GB (Blackwell, sm_120) DDP. No time cap.
+# Recipe: latent-diffusion SR U-Net (FA2) + SSM refiner (mamba-ssm bottleneck),
+# trained on DIV2K + Flickr2K + DF2K with on-the-fly Real-ESRGAN degradation.
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  hr_shard_dir: /workspace/data/sr/hr_shards     # webdataset .tar shards of HR images
+  val_dir:       /workspace/data/sr/div2k_val    # 100 fixed DIV2K-val HR images
+  patch_hr: 256          # random-crop HR patch size (train)
+  scale: 4               # 4× super-resolution → 64² LR input
+  num_workers: 8         # per-rank DataLoader workers
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  # Real-ESRGAN degradation (sampled stochastically per crop)
+  degradation:
+    blur_sigma: [0.2, 3.0]      # Gaussian blur sigma range
+    noise_sigma: [1.0, 30.0]    # Gaussian noise sigma (1=almost clean, 30=heavy)
+    jpeg_quality: [30, 95]      # JPEG compression quality range
+    sinc_prob: 0.15             # probability of final sinc filter
+    resize_prob: 0.25           # probability of the intermediate resize stage
+    second_blur_prob: 0.25       # probability of the second (isotropic/aniso) blur
+    shuffle_prob: 0.15          # probability of stage-order shuffle (Real-ESRGAN "2nd order")
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  vae:
+    model_id: stabilityai/sd-vae-ft-mse   # frozen SD1.5-class VAE (8× downsample)
+    scale_factor: 0.18215
+    dtype: bfloat16
+  sr_unet:
+    in_ch: 9          # 4 LR latent + 4 noisy latent + 1 LR-structure mask
+    out_ch: 4         # predicted noise in latent space
+    base_ch: 96       # base width; ch_mults (1,2,4,4) → deepest 384 ch → ~52 M params
+    ch_mults: [1, 2, 4, 4]
+    res_blks: 2
+    attn_levels: [1, 2, 3]
+    heads: 8          # 96/8=12 head-dim; all stage channels divisible by 8
+    t_dim: 256        # timestep embedding width (the design's "d")
+    grad_ckpt: true
+  refiner:
+    in_ch: 3
+    base_ch: 128      # ch_mults (1,2,4) → deepest 512 ch → ~23 M params
+    ch_mults: [1, 2, 4]
+    num_blocks: [4, 6, 6, 8]   # NAFNet-style block counts
+    ssm_state_dim: 16          # mamba-ssm selective-scan state dim
+    ssm_dilated_strides: [1, 2, 4]   # dilated multi-scan strides
+    grad_ckpt: true
+  scheduler:
+    train_steps: 1000
+    beta_start: 0.00085
+    beta_end: 0.012
+    schedule: scaled_linear
+    infer_steps: 30          # DDIM steps at inference
+    fast_steps: 10           # --fast mode
+
+# ── Training (100 K iters, BF16, DDP) ─────────────────────────────────────────
+train:
+  total_iters: 100000
+  batch_size_per_gpu: 32     # → effective 64 with grad_accum 2 × 2 GPUs
+  grad_accum: 2
+  grad_ckpt: true            # on the U-Net
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    fused: true               # Blackwell fused AdamW kernel
+  precision:
+    autocast: bfloat16
+    master_fp32: true         # FP32 master weights
+    fp32_layernorm: true      # FP32 LayerNorm (stable)
+    no_gradscaler: true       # BF16 → no GradScaler
+  schedule:
+    warmup_iters: 2000
+    eta_min_factor: 0.01     # cosine η_min = lr × factor
+  loss:
+    unet_mse: 1.0
+    unet_lpips: 0.1           # LPIPS on decoded HR
+    refiner_l1: 1.0
+    refiner_ssim: 0.05
+    joint: true               # train U-Net + refiner jointly (set false to stage)
+  ema:
+    decay: 0.9999
+  grad_clip: 1.0
+  nan_guard: true
+  channels_last: true         # Blackwell sm_120
+  tf32: true
+  cudnn_benchmark: true
+  compile:
+    enabled: true
+    mode: max-autotune        # compile U-Net + refiner; DDIM step loop stays eager
+  cuda_graphs: true           # capture fixed-shape step after warmup
+  ckpt:
+    every_iters: 10000
+    keep_last: 6
+    dir: /workspace/runs/upscale-sr
+  eval:
+    every_iters: 10000
+    fixed_seed: 42             # reproducible PSNR/LPIPS on DIV2K-val
+  log_every: 50
+  seed: 42
+
+# ── Inference / product ───────────────────────────────────────────────────────
+infer:
+  ckpt: sr_x4_final.safetensors
+  scale: 4
+  steps: 30
+  fast_steps: 10
+  target_latency_512_to_2048_s: 1.5
+
+# ── Export ────────────────────────────────────────────────────────────────────
+export:
+  safetensors_out: sr_x4_final.safetensors
+  onnx_out: refiner_x4.onnx
+  onnx_opset: 17
