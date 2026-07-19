@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import math
-from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +23,7 @@ from utils.config import load_config
 from utils.logging import is_main_process, setup_logger
 from utils.losses import build_lpips, lpips_loss_fn
 from data.sr_dataset import build_val_dataset
-from models import build_ddim
+from models import build_ddim, sr_cond_input
 
 
 def _psnr(x: torch.Tensor, y: torch.Tensor, data_range: float = 1.0) -> float:
@@ -54,20 +53,13 @@ def _sr_inference(model, ddim, lr, device, steps=30):
     z = torch.randn(lr.shape[0], 4, Hl, Wl, device=device)
     ddim.set_timesteps(steps, device=device)
     for t in ddim.timesteps:
-        unet_in = _cat_cond(lr_lat, z)
+        unet_in = sr_cond_input(lr_lat, z)
         eps = unet(unet_in, t.expand(lr.shape[0]))
         z = ddim.step(eps, t, z)
 
     img = vae.decode(z)                                       # (B,3,H,W) [-1,1]
     refined = refiner(img)                                    # (B,3,H,W) [-1,1]
     return (refined + 1) / 2                                  # [0,1]
-
-
-def _cat_cond(lr_lat, z_t):
-    lr_up = F.interpolate(lr_lat, size=z_t.shape[-2:], mode="bilinear",
-                          align_corners=False)
-    mask = lr_up.mean(dim=1, keepdim=True)
-    return torch.cat([lr_up, z_t, mask], dim=1)
 
 
 @torch.no_grad()

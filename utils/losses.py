@@ -87,5 +87,4 @@ def lpips_loss_fn(lpips: torch.nn.Module, x: torch.Tensor, y: torch.Tensor) -> t
     """Dispatch to `lpips.LPIPS` (expects [-1,1]) or the VGG fallback."""
     if isinstance(lpips, _LPIPSVGGFallback):
         return lpips(x, y)
-    with torch.no_grad() if False else torch.enable_grad():
-        return lpips(x, y).mean()
+    return lpips(x, y).mean()

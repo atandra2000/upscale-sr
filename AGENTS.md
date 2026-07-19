@@ -122,8 +122,8 @@ real-world LR from HR (DIV2K + Flickr2K + DF2K): blur (gaussian iso/aniso)
 a second-order stage shuffle. **Deterministic given a seed** (RNG
 save+seed+restore — tested in `tests/test_realesrgan_deg.py`).
 
-**Conditioning input** (`training/train.py:_sr_cond_input` /
-`infer.py:_sr_cond`): `cat(lr_lat_up, z_t, lr_lat_up.mean(dim=1,keepdim))` →
+**Conditioning input** (`models/cond.py:sr_cond_input`, used by
+`train.py`/`infer.py`/`eval.py`): `cat(lr_lat_up, z_t, lr_lat_up.mean(dim=1,keepdim))` →
 9 channels.
 
 **Selective-scan recurrence** (`models/ssm_refiner.py:selective_scan`):

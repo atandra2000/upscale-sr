@@ -18,7 +18,6 @@ Config (final, ``configs/sr_x4_realesrgan_2x5090.yaml``):
 from __future__ import annotations
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -20,7 +21,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from utils.config import load_config
-from models import build_sr_unet, build_ssm_refiner, build_ddim
+from models import build_sr_unet, build_ssm_refiner, build_ddim, sr_cond_input
 from models.vae_frozen import load_frozen_vae
 
 
@@ -32,22 +33,27 @@ def _load_image(path: str) -> torch.Tensor:
     return arr
 
 
-def _save_image(t: torch.Tensor, path: str) -> None:
-    """Save a (1,3,H,W) tensor in [0,1] (or [-1,1]) to ``path`` as PNG."""
+def load_image_pil(img: Image.Image) -> torch.Tensor:
+    """PIL RGB image → (1,3,H,W) tensor in [-1,1] (shared with demo_gradio)."""
+    import numpy as np
+    arr = torch.from_numpy(np.asarray(img.convert("RGB")).copy()).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
+    return arr
+
+
+def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
+    """Clamp a (1,3,H,W) tensor ([-1,1] or [0,1]) to a PIL RGB image."""
     import numpy as np
     if t.min() < -0.5:
         t = (t + 1) / 2
     t = t.clamp(0, 1)
     arr = (t[0].permute(1, 2, 0).cpu().numpy() * 255).round().astype("uint8")
+    return Image.fromarray(arr)
+
+
+def _save_image(t: torch.Tensor, path: str) -> None:
+    """Save a (1,3,H,W) tensor in [0,1] (or [-1,1]) to ``path`` as PNG."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr).save(path)
-
-
-def _sr_cond(lr_lat, z_t):
-    lr_up = F.interpolate(lr_lat, size=z_t.shape[-2:], mode="bilinear",
-                          align_corners=False)
-    mask = lr_up.mean(dim=1, keepdim=True)
-    return torch.cat([lr_up, z_t, mask], dim=1)
+    _tensor_to_pil(t).save(path)
 
 
 @torch.no_grad()
@@ -103,7 +109,7 @@ def upscale(
     z = torch.randn(1, 4, Hl, Wl, device=device)
     ddim.set_timesteps(steps, device=device)
     for t in ddim.timesteps:
-        eps = unet(_sr_cond(lr_lat, z), t.expand(1))
+        eps = unet(sr_cond_input(lr_lat, z), t.expand(1))
         z = ddim.step(eps, t, z)
     img = vae.decode(z)            # (1,3,H,W) [-1,1]
     refined = refiner(img)
@@ -188,17 +194,12 @@ def main():
     print(f"[upscale-sr] LR {tuple(lr.shape)} → {args.scale}× | {steps} steps | tiling crop={args.crop}")
     t0 = time.perf_counter()
     with torch.no_grad():
-        with torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else _nullctx():
+        with torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext():
             hr = upscale(lr, unet, refiner, vae, ddim, device,
                          scale=args.scale, steps=steps, crop=args.crop)
     dt = time.perf_counter() - t0
     _save_image(hr, args.out)
     print(f"[upscale-sr] HR {tuple(hr.shape)} written → {args.out} | {dt:.2f}s")
-
-
-def _nullctx():
-    from contextlib import nullcontext
-    return nullcontext()
 
 
 if __name__ == "__main__":

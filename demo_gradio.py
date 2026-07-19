@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import argparse
 import time
+from contextlib import nullcontext
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -18,7 +18,7 @@ from PIL import Image
 from utils.config import load_config
 from models import build_sr_unet, build_ssm_refiner, build_ddim
 from models.vae_frozen import load_frozen_vae
-from infer import upscale, _load_image, _save_image
+from infer import upscale, _load_image, _save_image, _tensor_to_pil, load_image_pil
 
 
 def _bicubic_baseline(lr_img: torch.Tensor, scale: int) -> torch.Tensor:
@@ -50,34 +50,17 @@ def build_pipeline(cfg, ckpt_path, device, stub_vae=False):
 
 
 def run(pipe, pil_img, scale, steps, crop):
-    lr = _load_image_from_pil(pil_img).to(pipe["device"])
+    lr = load_image_pil(pil_img).to(pipe["device"])
     bic = _bicubic_baseline(lr, scale).clamp(-1, 1)
     t0 = time.perf_counter()
     with torch.no_grad():
-        with torch.autocast("cuda", dtype=torch.bfloat16) if pipe["device"].type == "cuda" else _nullctx():
+        with torch.autocast("cuda", dtype=torch.bfloat16) if pipe["device"].type == "cuda" else nullcontext():
             sr = upscale(lr, pipe["unet"], pipe["refiner"], pipe["vae"],
                          pipe["ddim"], pipe["device"], scale, steps, crop)
     dt = time.perf_counter() - t0
     bic_img = _tensor_to_pil(bic)
     sr_img = _tensor_to_pil(sr)
     return bic_img, sr_img, f"{dt:.2f}s | LR {tuple(lr.shape)} → SR {tuple(sr.shape)}"
-
-
-def _load_image_from_pil(img: Image.Image) -> torch.Tensor:
-    arr = torch.from_numpy(np.asarray(img.convert("RGB")).copy()).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
-    return arr
-
-
-def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
-    t = (t + 1) / 2 if t.min() < -0.5 else t
-    t = t.clamp(0, 1)
-    arr = (t[0].permute(1, 2, 0).cpu().numpy() * 255).round().astype("uint8")
-    return Image.fromarray(arr)
-
-
-def _nullctx():
-    from contextlib import nullcontext
-    return nullcontext()
 
 
 def main():

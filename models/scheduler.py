@@ -99,8 +99,8 @@ class DDIMScheduler:
         ratio = self.num_train_timesteps // num_steps
         self.timesteps = (torch.arange(0, num_steps) * ratio).flip(0).long().to(device)
 
-    def step(self, noise_pred: torch.Tensor, t, x_t: torch.Tensor,
-             eta: float = 0.0) -> torch.Tensor:
+    def step(self, noise_pred: torch.Tensor, t, x_t: torch.Tensor) -> torch.Tensor:
+        """Deterministic (eta=0) DDIM update."""
         assert self.num_inference_steps is not None, "call set_timesteps() first"
         device = x_t.device
         t_int = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
@@ -113,10 +113,6 @@ class DDIMScheduler:
         pred_x0 = pred_x0.clamp(-1.0, 1.0)
         dir_xt = (1.0 - alpha_prev).sqrt() * noise_pred
         x_prev = alpha_prev.sqrt() * pred_x0 + dir_xt
-        if eta > 0.0:
-            sigma_t = eta * (((1.0 - alpha_prev) / (1.0 - alpha_t)) *
-                             (1.0 - alpha_t / alpha_prev)).clamp(min=0.0).sqrt()
-            x_prev = x_prev + sigma_t * torch.randn_like(x_t)
         return x_prev
 
 

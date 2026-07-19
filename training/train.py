@@ -25,7 +25,6 @@ structure hint aligned with the noisy latent).
 from __future__ import annotations
 
 import argparse
-import gc
 import os
 import time
 from contextlib import nullcontext
@@ -44,9 +43,10 @@ from utils.logging import setup_logger, is_main_process, log_env_summary, rank
 from utils.memory import apply_channels_last, gpu_vram_gb
 from utils.schedule import build_schedule
 from utils.stability import EMA, clip_and_guard
-from utils.checkpoint import CheckpointManager, strip_prefixes
+from utils.checkpoint import CheckpointManager
 from utils.losses import build_lpips, lpips_loss_fn, ssim_loss
-from models import build_sr_unet, build_ssm_refiner, build_ddpm, build_ddim
+from models import (build_sr_unet, build_ssm_refiner, build_ddpm, build_ddim,
+                     sr_cond_input)
 from models.vae_frozen import FrozenVAE
 
 # ── GPU flags — tuned for Blackwell (RTX 5090), same as SD_Train.py ──────────
@@ -129,22 +129,6 @@ def load_vae(cfg: dict, device, stub: bool = False):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 9-channel SR conditioning: [LR_latent_up | z_t | LR-structure mask]
-# ═══════════════════════════════════════════════════════════════════════════════
-def _sr_cond_input(lr_lat: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
-    """Build the 9-channel U-Net input from LR latent and noisy latent.
-
-    lr_lat : (B,4,h/8,w/8)  — frozen VAE encode of the LR image
-    z_t    : (B,4,H/8,W/8) — noisy HR latent at the target resolution
-    Returns (B,9,H/8,W/8) = [lr_lat_up(4), z_t(4), mask(1)].
-    """
-    lr_up = F.interpolate(lr_lat, size=z_t.shape[-2:], mode="bilinear",
-                          align_corners=False)
-    mask = lr_up.mean(dim=1, keepdim=True)            # 1-channel structure hint
-    return torch.cat([lr_up, z_t, mask], dim=1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # One training step (returns the loss dict, un-reduced for logging)
 # ═══════════════════════════════════════════════════════════════════════════════
 def train_step(
@@ -175,7 +159,7 @@ def train_step(
     noise = torch.randn_like(hr_lat)
     z_t, _ = ddpm.add_noise(hr_lat, t, noise)
 
-    unet_in = _sr_cond_input(lr_lat, z_t)                   # (B,9,H/8,W/8)
+    unet_in = sr_cond_input(lr_lat, z_t)                   # (B,9,H/8,W/8)
 
     ref_w = _refiner_weight(global_step, refiner_warmup_iters,
                             tcfg.get("refiner_warmup_ramp", 2000))
@@ -251,7 +235,6 @@ def main(rank_i: int, world_size: int, args):
     device = torch.device(f"cuda:{rank_i}") if torch.cuda.is_available() else torch.device("cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    gc.collect()
 
     cfg = load_config(args.config)
     tcfg = cfg["train"]
@@ -379,7 +362,6 @@ def main(rank_i: int, world_size: int, args):
     global_step = resume.get("step", 0)
     best_loss = resume.get("best_loss", float("inf"))
     optimizer.zero_grad(set_to_none=True)
-    accum_loss = 0.0
     t0 = time.perf_counter()
 
     logger.info(f"starting training: total_iters={total_iters} | grad_accum={grad_accum} | refiner_warmup={refiner_warmup}")
@@ -395,14 +377,7 @@ def main(rank_i: int, world_size: int, args):
 
         backward_loss, ldict = train_step(
             batch, model, ddpm, lpips_fn, cfg, device, refiner_warmup, it)
-        # skip DDP all-reduce on accumulation steps
-        no_sync = (hasattr(ddp_unet, "no_sync") and (it % grad_accum != 0)) if not args.stub else False
-        with (_unwrap(ddp_unet).no_sync() if False else nullcontext()):
-            # NOTE: DDP no_sync is handled by DDP itself when grad accumulates;
-            # we keep it simple — full all-reduce each micro-batch. The
-            # effective-batch target is met by optimizer.step() cadence.
-            backward_loss.backward()
-        accum_loss += float(backward_loss.detach()) * grad_accum
+        backward_loss.backward()
 
         if it % grad_accum == 0:
             grad_norm = clip_and_guard(params, max_norm=tcfg.get("grad_clip", 1.0),
@@ -428,7 +403,6 @@ def main(rank_i: int, world_size: int, args):
                 f"lpips {ldict['lpips']:.4f} | ref L1 {ldict['refiner_l1']:.4f} ssim {ldict['refiner_ssim']:.4f} "
                 f"(w={ldict['ref_w']:.2f}) | gn {grad_norm:.2f} | {ips:.1f} it/s | {vram:.1f}GB"
             )
-            accum_loss = 0.0
 
         # ── checkpoint + eval ──────────────────────────────────────────────
         if it % ckpt_every == 0 and is_main_process():

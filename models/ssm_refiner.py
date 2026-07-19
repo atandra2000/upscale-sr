@@ -21,8 +21,6 @@ fast path ≡ fallback on a toy input.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -216,8 +214,6 @@ class NAFBlock(nn.Module):
             nn.AdaptiveAvgPool2d(1), nn.Conv2d(mid, mid, 1),
         )
         self.conv2 = nn.Conv2d(mid, channels, 1)
-        # element-wise gating (GELU-derived) on the residual branch
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.gamma = nn.Parameter(torch.zeros(1, channels, 1, 1))
         nn.init.zeros_(self.conv2.weight)
         nn.init.zeros_(self.conv2.bias)
@@ -229,7 +225,7 @@ class NAFBlock(nn.Module):
         h = self.gate(h)                  # channels halved
         h = h * self.sca(h)
         h = self.conv2(h)
-        return res + h * self.gamma + self.beta * 0  # beta unused gate placeholder
+        return res + h * self.gamma
 
     def forward(self, x):
         if self.grad_ckpt and self.training:

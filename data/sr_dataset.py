@@ -8,35 +8,17 @@ Two modes:
     degradation seed (reproducible PSNR/LPIPS — DESIGN §6 / EXECUTION-PLAN
     acceptance criteria).
 
-Backends:
-  * ``webdataset`` shards (``.tar``) — the canonical RunPod path
-    (``/workspace/data/sr/hr_shards``), preferred for streaming.
-  * flat image directory (``*.png/.jpg/.webp``) — fallback for local / smoke
-    runs without webdataset installed.
-
-Both backends lazily decode with ``PIL`` + ``torch.from_numpy``; the heavy
-Real-ESRGAN pipeline runs on-GPU inside the training step (the loader emits the
-clean HR crop and a seed; the collate/step does the degradation so it benefits
-from BF16 + GPU kernels).  For simplicity this implementation degrades on CPU
-in the worker — moving degradation onto GPU is a Phase-3 optimisation knob.
+HR images are read from a flat directory of ``*.png/.jpg/.webp`` and decoded
+lazily with ``PIL``. The heavy Real-ESRGAN pipeline runs on CPU in the worker.
 """
 from __future__ import annotations
 
-import os
 import random
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DistributedSampler
-
-try:
-    import webdataset as wds  # type: ignore
-    _HAS_WDS = True
-except Exception:  # pragma: no cover
-    wds = None  # type: ignore
-    _HAS_WDS = False
 
 from .realesrgan_degrade import RealESRGANDegrader, make_lr_pair
 
@@ -51,7 +33,7 @@ def _to_minus1_to1(x: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flat-directory backend (always available)
+# Flat-directory HR source
 # ─────────────────────────────────────────────────────────────────────────────
 class _FlatDirHR(Dataset):
     """Lazily lists ``*.png/.jpg/.jpeg/.webp/.bmp`` under ``root`` (recursive)."""
@@ -75,26 +57,13 @@ class _FlatDirHR(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WebDataset backend (preferred on RunPod)
-# ─────────────────────────────────────────────────────────────────────────────
-def _wds_hr_pipeline(shard_glob: str, shardshuffle: int = 1000):
-    """Build a webdataset pipeline that yields (3,H,W) HR tensors in [0,1]."""
-    import webdataset as wds  # local import; only needed on the RunPod path
-    ds = (wds.WebDataset(shard_glob, shardshuffle=shardshuffle)
-          .decode("pil", handler=wds.warn_and_continue)
-          .map(lambda d: _pil_to_tensor(next(iter(d.values())))))
-    return ds
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # SR pair dataset (wraps an HR source + degrader)
 # ─────────────────────────────────────────────────────────────────────────────
 class SRDataset(Dataset):
     """Returns (LR, HR) tensors in [-1, 1] at the configured patch size.
 
     Args:
-        hr_root:  directory of HR images (flat-dir backend) OR a webdataset
-                  shard glob string (``/workspace/data/sr/hr_shards/HR-*.tar``).
+        hr_root:  directory of HR images.
         degrader: ``RealESRGANDegrader`` instance.
         patch_hr: HR crop size (train). 256² default.
         scale:    SR scale factor (4).
@@ -113,30 +82,16 @@ class SRDataset(Dataset):
         self.mode = mode
         self.base_seed = base_seed
         self.epoch = 0
-        if isinstance(hr_root, str) and ("*" in hr_root or ".tar" in hr_root):
-            if not _HAS_WDS:
-                raise RuntimeError("webdataset shard path given but `webdataset` "
-                                   "not installed; pip install webdataset")
-            self.backend = "wds"
-            self._wds = _wds_hr_pipeline(hr_root)
-            self._len = None  # webdataset length unknown without .length()
-        else:
-            self.backend = "flat"
-            self._flat = _FlatDirHR(hr_root)
-            self._len = len(self._flat)
+        self._flat = _FlatDirHR(hr_root)
+        self._len = len(self._flat)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __len__(self):
-        if self._len is None:
-            # Fallback length estimate for webdataset; replaced by a real count
-            # if the build script wrote a manifest alongside the shards.
-            return getattr(self, "_approx_len", 3000)
         return self._len
 
     def _crop(self, hr: torch.Tensor) -> torch.Tensor:
-        _, _, H, W = hr.shape if hr.dim() == 4 else (None, None, *hr.shape[-2:])
         if hr.dim() == 3:
             hr = hr.unsqueeze(0)
         _, _, H, W = hr.shape
@@ -158,11 +113,6 @@ class SRDataset(Dataset):
         return hr[:, :, top:top + ph, left:left + pw]
 
     def __getitem__(self, idx):
-        if self.backend == "wds":
-            # webdataset is iterable; materialise one sample by stepping.
-            # In practice we wrap with a DataLoader-compatible IterableDataset
-            # path; here we support the flat-dir path for tests/smoke.
-            raise RuntimeError("use the IterableSRDataset wrapper for webdataset")
         hr = self._flat[idx]                       # (3,H,W) [0,1]
         hr_crop = self._crop(hr.unsqueeze(0))      # (1,3,ph,pw)
         # per-sample, per-epoch seed → fresh degradation each epoch (train)
@@ -173,10 +123,10 @@ class SRDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Distributed sampler (flat-dir backend)
+# Distributed sampler
 # ─────────────────────────────────────────────────────────────────────────────
 class SRDistributedSampler(DistributedSampler):
-    """Shards the flat-dir SR dataset across DDP ranks, epoch-shuffled."""
+    """Shards the SR dataset across DDP ranks, epoch-shuffled."""
 
     def __init__(self, dataset: SRDataset, num_replicas=None, rank=None,
                  seed: int = 42):

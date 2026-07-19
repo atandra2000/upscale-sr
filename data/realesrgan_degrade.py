@@ -228,11 +228,6 @@ class RealESRGANDegrader:
         return img.clamp(0, 1)
 
 
-def build_degrader(cfg: dict) -> RealESRGANDegrader:
-    data_cfg = cfg.get("data", cfg)
-    return RealESRGANDegrader(data_cfg)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience: HR patch → LR patch at the SR scale (the training-pair builder)
 # ─────────────────────────────────────────────────────────────────────────────

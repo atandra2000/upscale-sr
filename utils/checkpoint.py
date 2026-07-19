@@ -32,21 +32,6 @@ import torch
 from safetensors.torch import load_file, save_file
 
 
-def strip_prefixes(state_dict: dict, prefixes=("module.", "_orig_mod.")) -> dict:
-    """Remove DDP / torch.compile wrapper prefixes so ckpts restore cross-runner."""
-    cleaned = {}
-    for k, v in state_dict.items():
-        changed = True
-        while changed:
-            changed = False
-            for p in prefixes:
-                if k.startswith(p):
-                    k = k[len(p):]
-                    changed = True
-        cleaned[k] = v
-    return cleaned
-
-
 def rng_state_dict() -> dict:
     """Capture the full RNG state for perfect resumption."""
     return {
