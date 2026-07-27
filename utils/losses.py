@@ -5,9 +5,6 @@ import torch
 import torch.nn.functional as F
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SSIM (differentiable, no external dep) — used by the refiner loss.
-# ─────────────────────────────────────────────────────────────────────────────
 def _gaussian_window(window_size: int, sigma: float, device, dtype) -> torch.Tensor:
     ax = torch.arange(window_size, device=device, dtype=dtype) - (window_size - 1) / 2
     g = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
@@ -40,11 +37,6 @@ def ssim_loss(x: torch.Tensor, y: torch.Tensor, window_size: int = 11,
     return 1.0 - _ssim_map(x, y, win).mean()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LPIPS — uses the `lpips` package when available; falls back to a VGG-feature
-# L2 via torchvision (DESIGN §8: VGG feature extractor mismatch → use
-# torchvision.models.vgg16 features).  Both are perceptual losses only.
-# ─────────────────────────────────────────────────────────────────────────────
 class _LPIPSVGGFallback(torch.nn.Module):
     """L2 distance between VGG16 conv3_3 features of x and y (B,3,H,W) in [-1,1]."""
 
@@ -72,7 +64,7 @@ class _LPIPSVGGFallback(torch.nn.Module):
 
 
 def build_lpips(device) -> torch.nn.Module:
-    """Return a perceptual-loss module. Tries `lpips.LPIPS`, else VGG fallback."""
+    """Return a perceptual loss module. Tries `lpips.LPIPS`, else VGG fallback."""
     try:
         import lpips as lpips_pkg  # type: ignore
         loss = lpips_pkg.LPIPS(net="vgg").to(device).eval()

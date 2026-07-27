@@ -1,19 +1,7 @@
 """Latent-diffusion SR U-Net with FlashAttention-2 (DESIGN §1.2).
 
-Conditioning is **concat-based** (not text cross-attention): the 9-channel
-input is ``[4 LR latent | 4 noisy latent | 1 LR-structure mask]``.  A sinusoidal
-timestep embedding is injected as a channel-wise bias after the first conv of
-every ResBlock (same scheme as the portfolio's ``SD_Model.py``).
-
-Attention runs on **FlashAttention-2** when the ``flash-attn`` package is
-available on Blackwell (sm_120); otherwise it falls back to
-``F.scaled_dot_product_attention`` with the flash backend — never to a naive
-softmax.  (CLAUDE.md §1 / vision-research README §4.2: optimised kernels over
-pure PyTorch; pure-PyTorch only as a last resort.)
-
-Config (final, ``configs/sr_x4_realesrgan_2x5090.yaml``):
-    in_ch=9, out_ch=4, base_ch=256, ch_mults=(1,2,4,4), res_blks=2,
-    attn_levels=(1,2,3), heads=16, t_dim=256  →  ~40 M trainable params.
+Conditioning is concat-based (9-channel input `[lr_lat_up | z_t | lr_mask]`).
+FA2 self-attention on Ampere/Blackwell; sdpa flash-backend fallback on others.
 """
 from __future__ import annotations
 
@@ -41,12 +29,7 @@ def fa2_available() -> bool:
 # FlashAttention-2 self-attention block for 2D feature maps
 # ═══════════════════════════════════════════════════════════════════════════════
 class FA2SelfAttention(nn.Module):
-    """Multi-head self-attention on (B, C, H, W) via FlashAttention-2.
-
-    Layout: GroupNorm → 1×1 QKV → flash-attn → 1×1 out + residual.
-    Output projection zero-initialised so the block starts as identity
-    (stable early training, same trick as ``SD_Model.AttentionBlock``).
-    """
+    """Multi-head self-attention on (B, C, H, W) via FA2 (sdpa flash-backend fallback)."""
 
     def __init__(self, channels: int, num_heads: int = 16):
         super().__init__()
@@ -88,9 +71,6 @@ class FA2SelfAttention(nn.Module):
         return self.proj(out) + x  # residual
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ResBlock with timestep conditioning (and optional FA2 attention)
-# ═══════════════════════════════════════════════════════════════════════════════
 class SRResBlock(nn.Module):
     """GN → SiLU → Conv + time-bias → GN → SiLU → Conv + skip. Optional attn."""
 
@@ -124,18 +104,8 @@ class SRResBlock(nn.Module):
         return self._forward(x, t_emb)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Latent-diffusion SR U-Net
-# ═══════════════════════════════════════════════════════════════════════════════
 class SRUNet(nn.Module):
-    """Conditional denoising U-Net operating in VAE latent space.
-
-    Input  : (B, 9, H/8, W/8)  — concat of LR latent + noisy latent + mask
-    Output : (B, 4, H/8, W/8)  — predicted noise ε in latent space
-
-    4 encoder / 4 decoder stages, base_ch=256, skip connections along the
-    channel dim.  Self-attention (FA2) at the top-3 resolutions.
-    """
+    """Conditional denoising U-Net in VAE latent space: (B,9,H/8,W/8) → (B,4,H/8,W/8)."""
 
     def __init__(
         self,
@@ -152,13 +122,13 @@ class SRUNet(nn.Module):
         super().__init__()
         self.grad_ckpt = grad_ckpt
         self.t_dim = t_dim
-        # Sinusoidal time embedding → 2-layer MLP
+        from .cond import LRUpConv
+        self.lr_up = LRUpConv(channels=4)
         self.t_emb = nn.Sequential(
             nn.Linear(t_dim, t_dim * 4), nn.SiLU(), nn.Linear(t_dim * 4, t_dim),
         )
         self.conv_in = nn.Conv2d(in_ch, base_ch, 3, padding=1)
 
-        # ── Encoder ──────────────────────────────────────────────────────────
         self.downs = nn.ModuleList()
         ch_list, cur = [], base_ch
         for i, mult in enumerate(ch_mults):
@@ -171,13 +141,11 @@ class SRUNet(nn.Module):
             if i < len(ch_mults) - 1:
                 self.downs.append(nn.Conv2d(cur, cur, 3, stride=2, padding=1))
 
-        # ── Bottleneck ──────────────────────────────────────────────────────
         self.mid = nn.ModuleList([
             SRResBlock(cur, cur, t_dim, use_attn=True, heads=heads, grad_ckpt=grad_ckpt),
             SRResBlock(cur, cur, t_dim, use_attn=False, heads=heads, grad_ckpt=grad_ckpt),
         ])
 
-        # ── Decoder ────────────────────────────────────────────────────────
         self.ups = nn.ModuleList()
         for i, mult in reversed(list(enumerate(ch_mults))):
             nxt = base_ch * mult
@@ -193,7 +161,7 @@ class SRUNet(nn.Module):
 
         self.norm_out = nn.GroupNorm(32, base_ch)
         self.conv_out = nn.Conv2d(base_ch, out_ch, 3, padding=1)
-        nn.init.zeros_(self.conv_out.weight)  # zero-init → predicts zero noise at init
+        nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
     def enable_gradient_checkpointing(self):

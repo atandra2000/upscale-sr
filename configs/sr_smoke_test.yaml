@@ -1,0 +1,33 @@
+# Small Smoke SR config — for tests / dev boxes that can't dispatch the
+# production 1024-group depthwise conv under BF16 (pre-Ampere GPUs).
+# NOT for real training or evaluation.
+model:
+  vae:
+    model_id: stabilityai/sd-vae-ft-mse
+    scale_factor: 0.18215
+    dtype: bfloat16
+  sr_unet:
+    in_ch: 9
+    out_ch: 4
+    base_ch: 32
+    ch_mults: [1, 2, 4]
+    res_blks: 1
+    attn_levels: [1, 2]
+    heads: 4
+    t_dim: 64
+    grad_ckpt: false
+  refiner:
+    in_ch: 3
+    base_ch: 16
+    ch_mults: [1, 2, 4]
+    num_blocks: [1, 1, 1, 1]
+    ssm_state_dim: 4
+    ssm_dilated_strides: [1, 2, 4]
+    grad_ckpt: false
+  scheduler:
+    train_steps: 1000
+    beta_start: 0.00085
+    beta_end: 0.012
+    schedule: scaled_linear
+    infer_steps: 4
+    fast_steps: 2

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-import sys  # ponytail: os removed (unused)
+import sys
 from pathlib import Path
 
 import torch
@@ -12,10 +12,6 @@ import torch.distributed as dist
 def is_main_process() -> bool:
     """True on rank 0 (or when DDP is not initialized)."""
     return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
-
-
-def rank() -> int:
-    return dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
 
 
 def setup_logger(name: str = "upscale-sr", log_file: str | None = None) -> logging.Logger:

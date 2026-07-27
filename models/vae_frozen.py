@@ -1,12 +1,7 @@
-"""Frozen SD1.5-class VAE — reused from ``Vision/StableDiffusion``.
+"""Frozen SD1.5-class VAE — encode LR → latent, decode SR latent → HR image.
 
-The VAE is permanently frozen and used only to:
-  * encode the LR image     (B,3,H,W) → LR latent (B,4,H/8,W/8)
-  * decode the SR latent      (B,4,H/8,W/8) → HR image (B,3,H,W)
-
-It is never trained.  We reuse the portfolio's already-downloaded
-``stabilityai/sd-vae-ft-mse`` weights (the same VAE used by StableDiffusion).
-Per DESIGN §1.1, the same frozen VAE is later reused by Inpaint-Edit (02).
+Permanently frozen; reused from ``stabilityai/sd-vae-ft-mse``.  The scale
+factor (0.18215) normalises latents to unit variance for stable diffusion.
 """
 from __future__ import annotations
 
@@ -17,10 +12,7 @@ import torch.nn as nn
 class FrozenVAE(nn.Module):
     """Thin frozen wrapper around a HuggingFace ``AutoencoderKL``.
 
-    Direct encoder access (``.mean`` instead of ``.sample()``) for
-    deterministic, faster inference.  The scale factor (0.18215) is the
-    empirical std of the LAION-2B latent distribution and normalises latents
-    to unit variance for stable diffusion training (same as SD_Train.py).
+    Uses ``.mean`` for deterministic encode.  SCALE_FACTOR normalises latents.
     """
 
     SCALE_FACTOR = 0.18215
@@ -51,9 +43,6 @@ class FrozenVAE(nn.Module):
         """Scaled latents → images in [-1, 1] (B, 3, H, W)."""
         z = (z.to(dtype=self.dtype) / self.scale_factor)
         return self.vae.decode(z).sample
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # round-trip sanity
-        return self.decode(self.encode(x))
 
 
 def load_frozen_vae(cfg: dict, device) -> FrozenVAE:

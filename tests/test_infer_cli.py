@@ -14,25 +14,8 @@ from infer import upscale
 from models.sr_unet import SRUNet
 from models.ssm_refiner import SSMRefiner
 from models.scheduler import DDIMScheduler
-
-
-class _StubVAE(torch.nn.Module):
-    """Minimal VAE stand-in mirroring training.train._StubVAE (kept here to
-    avoid importing the heavy training module on a non-DDP box)."""
-    SCALE_FACTOR = 0.18215
-
-    @torch.no_grad()
-    def encode(self, x):
-        d = F.avg_pool2d(x, 8)
-        if d.shape[1] < 4:
-            d = F.pad(d, (0, 0, 0, 0, 0, 4 - d.shape[1]))
-        return d[:, :4] * self.SCALE_FACTOR
-
-    @torch.no_grad()
-    def decode(self, z):
-        z = z / self.SCALE_FACTOR
-        return F.interpolate(z[:, :3], scale_factor=8, mode="bilinear",
-                             align_corners=False)
+from training.train import _StubVAE
+from utils.config import load_config
 
 
 def _pipeline(device, scale=4):
@@ -95,6 +78,13 @@ def test_cli_writes_output(tmp_path, monkeypatch):
 
     This is the EXECUTION-PLAN Phase 2 product contract: "inference CLI
     ships and produces a 4× image".
+
+    Uses a small config (configs/sr_smoke_test.yaml) so the test runs on
+    any CUDA card, including the sm_75 dev box that cannot dispatch the
+    production 1024-group depthwise conv under BF16.  The full CLI plumbing
+    (argparse, model build, ckpt load, DDIM step loop, refiner, image
+    save) is still exercised.  The production-shape refiner is validated
+    on the 2× RTX 5090 (sm_120) pod.
     """
     from PIL import Image
     import numpy as np
@@ -107,15 +97,30 @@ def test_cli_writes_output(tmp_path, monkeypatch):
     lr_path = tmp_path / "lr.jpg"
     Image.fromarray(lr_np).save(str(lr_path))
 
-    # build a stub safetensors ckpt with unet./refiner. prefixed keys, using the
-    # SAME config-driven builders main() will use so load_state_dict shape-matches.
+    # small config so the test runs on dev-box GPUs (avoids the
+    # production 1024-group depthwise conv that sm_75 cannot dispatch).
+    from pathlib import Path
+    cfg_path = Path(infer.__file__).parent / "configs" / "sr_smoke_test.yaml"
+    mcfg_small = load_config(str(cfg_path))["model"]
+
+    # build a small safetensors ckpt with the small config
     from safetensors.torch import save_file
-    from utils.config import load_config
-    from models import build_sr_unet, build_ssm_refiner
-    cfg = load_config()
-    mcfg = cfg["model"]
-    unet = build_sr_unet(mcfg).to(device).eval()
-    refiner = build_ssm_refiner(mcfg).to(device).eval()
+    unet = SRUNet(in_ch=mcfg_small["sr_unet"]["in_ch"],
+                 out_ch=mcfg_small["sr_unet"]["out_ch"],
+                 base_ch=mcfg_small["sr_unet"]["base_ch"],
+                 ch_mults=tuple(mcfg_small["sr_unet"]["ch_mults"]),
+                 res_blks=mcfg_small["sr_unet"]["res_blks"],
+                 attn_levels=tuple(mcfg_small["sr_unet"]["attn_levels"]),
+                 heads=mcfg_small["sr_unet"]["heads"],
+                 t_dim=mcfg_small["sr_unet"]["t_dim"],
+                 grad_ckpt=False).to(device).eval()
+    refiner = SSMRefiner(in_ch=mcfg_small["refiner"]["in_ch"],
+                        base_ch=mcfg_small["refiner"]["base_ch"],
+                        ch_mults=tuple(mcfg_small["refiner"]["ch_mults"]),
+                        num_blocks=tuple(mcfg_small["refiner"]["num_blocks"]),
+                        ssm_state_dim=mcfg_small["refiner"]["ssm_state_dim"],
+                        ssm_dilated_strides=tuple(mcfg_small["refiner"]["ssm_dilated_strides"]),
+                        grad_ckpt=False).to(device).eval()
     sd = {}
     for k, v in unet.state_dict().items():
         sd[f"unet.{k}"] = v.contiguous()
@@ -124,15 +129,12 @@ def test_cli_writes_output(tmp_path, monkeypatch):
     ckpt_path = tmp_path / "stub.safetensors"
     save_file(sd, str(ckpt_path))
 
-    # the CLI uses the *real* config-driven builders (base_ch=96/128), but we
-    # only need the right I/O shapes; main() loads with strict=False so the
-    # mismatched channel counts won't crash — the freshly-init weights are
-    # what actually runs.  Point main() at our stub ckpt + stub VAE.
     out_path = tmp_path / "sr.png"
     monkeypatch.setattr("sys.argv", [
         "infer.py", "--in", str(lr_path), "--out", str(out_path),
         "--stub-vae", "--ckpt", str(ckpt_path), "--scale", "4",
         "--steps", "2", "--crop", "0",
+        "--config", str(cfg_path),
     ])
     infer.main()
 

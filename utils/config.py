@@ -5,10 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-try:
-    import yaml
-except ImportError as e:  # pragma: no cover
-    raise ImportError("PyYAML is required: pip install pyyaml") from e
+import yaml
 
 
 _DEFAULT_CFG = Path(__file__).resolve().parent.parent / "configs" / "sr_x4_realesrgan_2x5090.yaml"

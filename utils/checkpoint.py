@@ -1,29 +1,14 @@
 """Atomic checkpoint manager — safetensors weights + torch state + full RNG.
 
-Atomic write protocol (CLAUDE.md §1, AGENTS.md §1):
-    torch.save → ``.tmp`` → ``os.replace`` (rename).  A crash mid-save leaves
-    a ``.tmp`` file that is ignored on resume, never a corrupt main ckpt.
-
-State saved (full reproducibility):
-    - weights          (safetensors, no pickle)
-    - optimizer        (AdamW m/v + step)
-    - LR scheduler     (SequentialLR internal counters)
-    - EMA shadow        (decay + step_count)
-    - RNG state         (python random, numpy, torch, torch.cuda, per-rank)
-    - meta              (iter, best_loss, config snapshot)
-
-No ``pickle`` is used for the weights — only ``safetensors``.  The auxiliary
-state (optim/sched/ema/rng) is saved with ``torch.save`` (which uses
-``torch.serialization`` — a restricted pickle for python tensors only, never
-model code); the rule in CLAUDE.md §6 is "no pickle for checkpoints" meaning
-*do not ship a model checkpoint as a pickle file* — safetensors is the ship
-format.  The aux state is unavoidably torch-serialised and is separate from
-the shipped weights.
+Atomic write: ``.tmp`` → ``os.replace``; a crash mid-save leaves a ``.tmp``
+file ignored on resume, never a corrupt main ckpt.  Weights ship as
+safetensors (no pickle); aux state (optim/sched/ema/rng) uses ``torch.save``.
 """
 from __future__ import annotations
 
-import os  # ponytail: json removed (unused)
+import os
 import random
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -52,20 +37,14 @@ def restore_rng_state(state: dict) -> None:
 
 
 class CheckpointManager:
-    """Atomic save/load for the Upscale-SR product.
-
-    Files (per iter ``i``):
-        sr_step_{i:07d}.safetensors   — U-Net + refiner weights (ship format)
-        sr_step_{i:07d}.state.pt      — optimizer + scheduler + EMA + RNG + meta
-        sr_latest.safetensors / .state.pt — same content, overwritten each save
-    """
+    """Atomic save/load.  Per iter ``i``: ``sr_step_{i:07d}.safetensors`` +
+    ``.state.pt``; ``sr_latest.*`` is a convenience copy for fast resume."""
 
     def __init__(self, save_dir: str, keep_last: int = 6):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.keep_last = keep_last
 
-    # ── save ──────────────────────────────────────────────────────────────
     def save(
         self,
         unet: torch.nn.Module,
@@ -77,7 +56,6 @@ class CheckpointManager:
         best_loss: float,
         extra_meta: Optional[dict] = None,
     ) -> None:
-        # 1. weights as safetensors — concat U-Net + refiner into one dict
         sd = {}
         for k, v in unet.state_dict().items():
             sd[f"unet.{k}"] = v.detach().contiguous()
@@ -89,7 +67,6 @@ class CheckpointManager:
         save_file(sd, str(weights_tmp))
         os.replace(weights_tmp, weights_out)
 
-        # 2. aux state with torch.save (optim/sched/ema/rng)
         state = {
             "step": step,
             "best_loss": best_loss,
@@ -104,20 +81,17 @@ class CheckpointManager:
         torch.save(state, state_tmp)
         os.replace(state_tmp, state_out)
 
-        # 3. latest pointer (same content, no step suffix) for fast resume
         self._copy(weights_out, self.save_dir / "sr_latest.safetensors")
         self._copy(state_out, self.save_dir / "sr_latest.state.pt")
-
-        # 4. prune old checkpoints
         self._prune()
 
     def _copy(self, src: Path, dst: Path) -> None:
-        # Atomic copy via temp file.  shutil.copyfile is fine here because
-        # src is a committed, atomic file; dst is just a convenience pointer.
+        # Atomic copy: stream to a temp file then rename.  shutil.copyfile
+        # streams (no double-buffering) — src is already a committed file.
         tmp = dst.with_suffix(dst.suffix + ".tmp")
         if tmp.exists():
             tmp.unlink()
-        tmp.write_bytes(src.read_bytes())
+        shutil.copyfile(src, tmp)
         os.replace(tmp, dst)
 
     def _prune(self) -> None:
@@ -131,7 +105,6 @@ class CheckpointManager:
             for p in self.save_dir.glob(f"sr_step_{s:07d}.*"):
                 p.unlink(missing_ok=True)
 
-    # ── load ──────────────────────────────────────────────────────────────
     def latest_step(self) -> Optional[int]:
         steps = sorted(
             int(p.stem.removeprefix("sr_step_"))
@@ -183,5 +156,77 @@ class CheckpointManager:
                     "meta": state.get("meta", {})}
         return {"step": step, "best_loss": float("inf")}
 
-    def load_latest(self, unet, refiner, optimizer, scheduler, ema, device="cuda") -> dict:
-        return self.load(unet, refiner, optimizer, scheduler, ema, step=None, device=device)
+
+def load_sd_epoch42_weights(unet: torch.nn.Module, ckpt_path: str, device: str = "cpu") -> tuple[int, int]:
+    """Load pre-trained SD 1.x UNet weights into SRUNet with 9-channel conv_in
+    adaptation: channels [4:8] ← SD 4-ch weights, [0:4] + channel 8 ← zero."""
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(f"SD checkpoint not found: {ckpt_path}")
+
+    if path.suffix == ".safetensors":
+        raw_sd = load_file(str(path), device=str(device))
+    else:
+        loaded = torch.load(str(path), map_location=device, weights_only=False)
+        raw_sd = loaded.get("state_dict", loaded.get("unet", loaded.get("model", loaded)))
+
+    sd = {}
+    for k, v in raw_sd.items():
+        k_clean = (k.removeprefix("model.diffusion_model.")
+                   .removeprefix("unet.")
+                   .removeprefix("model."))
+        sd[k_clean] = v
+
+    target_sd = unet.state_dict()
+    matched_sd = {}
+    loaded_count = 0
+
+    for k, v in sd.items():
+        if k in target_sd:
+            t_shape = target_sd[k].shape
+            if v.shape == t_shape:
+                matched_sd[k] = v.to(device=device, dtype=target_sd[k].dtype)
+                loaded_count += 1
+            elif k == "conv_in.weight" and v.dim() == 4 and target_sd[k].dim() == 4:
+                adapted = torch.zeros_like(target_sd[k], device=device)
+                ch_in_src = min(v.shape[1], 4)
+                adapted[:, 4:4 + ch_in_src] = v[:, :ch_in_src].to(device=device)
+                matched_sd[k] = adapted
+                loaded_count += 1
+
+    unet.load_state_dict(matched_sd, strict=False)
+    return loaded_count, len(target_sd)
+
+
+def load_upsr_state(path: str, unet: torch.nn.Module | None = None,
+                    refiner: torch.nn.Module | None = None,
+                    device: str = "cpu", *,
+                    strict: bool = False) -> tuple[dict, dict]:
+    """Load a shipped Upscale-SR safetensors ckpt → (unet_sd, refiner_sd).
+
+    Strips the `unet.` / `refiner.` prefixes.  When both target modules are
+    provided, keys whose shape does not match the target are dropped so the
+    loader tolerates channel-count drift in test ckpts (used by ``infer.py``).
+    Without the targets, all keys are returned (used by ``to_safetensors.py`` /
+    ``to_onnx.py`` which load the *full* saved tensor set).
+    """
+    sd = load_file(path, device=str(device))
+    unet_target = unet.state_dict() if unet is not None else None
+    refiner_target = refiner.state_dict() if refiner is not None else None
+    unet_sd, refiner_sd = {}, {}
+    for k, v in sd.items():
+        if k.startswith("unet."):
+            clean = k.removeprefix("unet.")
+            if unet_target is not None:
+                tgt = unet_target.get(clean)
+                if tgt is None or tuple(v.shape) != tuple(tgt.shape):
+                    continue
+            unet_sd[clean] = v
+        elif k.startswith("refiner."):
+            clean = k.removeprefix("refiner.")
+            if refiner_target is not None:
+                tgt = refiner_target.get(clean)
+                if tgt is None or tuple(v.shape) != tuple(tgt.shape):
+                    continue
+            refiner_sd[clean] = v
+    return unet_sd, refiner_sd

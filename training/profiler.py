@@ -1,12 +1,4 @@
-"""GPU utilization profiler — asserts ≥ 95% util (EXECUTION-PLAN acceptance).
-
-Polls ``nvidia-smi`` once per ``interval_s`` for ``duration_s`` and reports
-the mean / min / p50 / p95 GPU-uti% and memory.  Used as a Phase-3 / Phase-4
-knob: if mean util < 95%, enable CUDA graphs or increase the per-GPU batch.
-
-Can be run standalone (alongside training, on rank 0):
-    python -m training.profiler --duration 60 --interval 1 --gpu 0
-"""
+"""GPU utilisation profiler — polls nvidia-smi, reports mean/p50/p95 util."""
 from __future__ import annotations
 
 import argparse

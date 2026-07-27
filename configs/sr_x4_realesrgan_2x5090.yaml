@@ -102,6 +102,8 @@ train:
     fixed_seed: 42             # reproducible PSNR/LPIPS on DIV2K-val
   log_every: 50
   seed: 42
+  refiner_warmup_iters: 10000   # refiner loss weight = 0 until this iter
+  refiner_warmup_ramp: 2000     # linear ramp 0→1 over this many iters after warmup
 
 # ── Inference / product ───────────────────────────────────────────────────────
 infer:

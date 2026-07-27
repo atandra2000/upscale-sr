@@ -1,24 +1,11 @@
-"""Real-ESRGAN stochastic degradation pipeline (DESIGN §1.4 / candidate §3.3).
+"""Real-ESRGAN stochastic degradation (arXiv:2107.10833), applied on-the-fly per crop.
 
-The canonical "first-order" + "second-order" Real-ESRGAN degradation
-(arXiv:2107.10833).  Applied **on-the-fly per crop** during training so the
-model sees a fresh degradation sample every epoch — no pre-degradation storage.
-
-Pipeline (first order):
-    blur (Gaussian) → resize (sinc/area/bicubic) → noise (Gaussian/Poisson)
-    → JPEG → (final sinc filter, with prob ``sinc_prob``)
-
-Second-order shuffles the stage order with prob ``shuffle_prob`` and inserts
-a second blur (isotropic/anisotropic) with prob ``second_blur_prob`` — this
-makes the degradation closer to real-world camera pipelines (where blur can
-follow noise, etc.).
-
-Deterministic given a seed: ``tests/test_realesrgan_deg.py`` asserts the
-same seed → the same degraded output (reproducible val PSNR/LPIPS).
+First-order: blur → resize → noise → JPEG → sinc.  Second-order shuffles the
+stage order with prob ``shuffle_prob`` and inserts a second blur with prob
+``second_blur_prob``.  Deterministic given a seed (RNG save/seed/restore).
 """
 from __future__ import annotations
 
-import io
 import math
 import random
 from typing import Tuple
@@ -26,11 +13,8 @@ from typing import Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageFilter
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Low-level blur / sinc kernels
-# ─────────────────────────────────────────────────────────────────────────────
+
 def _gaussian_kernel2d(sigma: float, kernel_size: int, device, dtype) -> torch.Tensor:
     """Isotropic 2-D Gaussian kernel (normalised), as (k, 1, s, s) conv weight."""
     ax = torch.arange(kernel_size, device=device, dtype=dtype) - (kernel_size - 1) / 2
@@ -65,7 +49,6 @@ def _aniso_blur(img: torch.Tensor, sigma_x: float, sigma_y: float) -> torch.Tens
                    (2 * sigma_y * sigma_y + 1e-12)); gy = gy / gy.sum()
     k2d = gx[:, None] * gy[None, :]                       # (kx, ky) = (kh, kw)
     w = k2d[None, None].expand(3, 1, -1, -1).contiguous()
-    # conv2d padding is (ph, pw) = (kh//2, kw//2) = (kx//2, ky//2) = (ax, ay)
     return F.conv2d(img, w, padding=(ax, ay), groups=3)
 
 
@@ -90,20 +73,19 @@ def _sinc_filter(img: torch.Tensor, cutoff: float, kernel_size: int = 21) -> tor
     return F.conv2d(img, w, padding=kernel_size // 2, groups=3)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JPEG / noise / resize stages
-# ─────────────────────────────────────────────────────────────────────────────
 def _jpeg_compress(img: torch.Tensor, quality: int) -> torch.Tensor:
-    """JPEG compress a (B,3,H,W) [0,1] tensor → (B,3,H,W) [0,1]. Round-trips
-    through PIL per-image; quality is the PIL JPEG quality (1–95)."""
+    """JPEG compress a (B,3,H,W) [0,1] tensor → (B,3,H,W) [0,1] via torchvision.
+
+    # ponytail: per-image round-trip; torchvision.io.encode_jpeg is the GPU-side
+    # upgrade path if JPEG becomes the dataloader bottleneck.
+    """
+    from torchvision.io import encode_jpeg, decode_jpeg
     out = []
     for b in range(img.shape[0]):
-        arr = (img[b].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)
-        buf = io.BytesIO()
-        Image.fromarray(arr).save(buf, format="JPEG", quality=int(quality))
-        buf.seek(0)
-        dec = np.asarray(Image.open(buf).convert("RGB"), dtype=np.float32) / 255.0
-        out.append(torch.from_numpy(dec).permute(2, 0, 1).to(img.device, img.dtype))
+        arr = (img[b].clamp(0, 1) * 255).round().to(torch.uint8)
+        enc = encode_jpeg(arr, int(quality))
+        dec = decode_jpeg(enc).to(img.dtype) / 255.0
+        out.append(dec.to(img.device, img.dtype))
     return torch.stack(out, dim=0)
 
 
@@ -112,7 +94,6 @@ def _add_noise(img: torch.Tensor, sigma: float, poisson: bool, rng) -> torch.Ten
     if sigma <= 0.01 and not poisson:
         return img
     if poisson:
-        # scale up so the Poisson's variance ~ σ; clamp to avoid huge λ
         lam = max(1e-3, sigma * sigma)
         noisy = torch.poisson(img * lam) / lam
         return noisy.clamp(0, 1)
@@ -134,17 +115,10 @@ def _resize_stage(img: torch.Tensor, rng, scale: float) -> torch.Tensor:
                          align_corners=align)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Full Real-ESRGAN degradation
-# ─────────────────────────────────────────────────────────────────────────────
 class RealESRGANDegrader:
-    """Stochastic Real-ESRGAN degradation for training-pair generation.
+    """Stochastic Real-ESRGAN degradation.  ``degrade(hr, seed)`` → LR image.
 
-    ``degrade(hr, seed)`` takes an HR image (B,3,H,W) in [0,1] and returns the
-    degraded LR image (B,3,H,W) in [0,1] at the configured down-scale.  For
-    SR training the loader downsamples the result to the LR patch size
-    separately (``scale`` here is the *intermediate* resize factor, not the
-    final SR scale — see Real-ESRGAN §3.2).
+    ``scale`` here is the *intermediate* resize factor, not the final SR scale.
     """
 
     def __init__(self, cfg: dict):
@@ -156,7 +130,6 @@ class RealESRGANDegrader:
         self.resize_prob = float(d.get("resize_prob", 0.25))
         self.second_blur_prob = float(d.get("second_blur_prob", 0.25))
         self.shuffle_prob = float(d.get("shuffle_prob", 0.15))
-        self.jpeg_prob = 1.0  # JPEG almost always applied in Real-ESRGAN
 
     def _rng(self, seed: int) -> random.Random:
         return random.Random(int(seed))
@@ -165,12 +138,11 @@ class RealESRGANDegrader:
     def degrade(self, hr: torch.Tensor, seed: int) -> torch.Tensor:
         """Apply the stochastic pipeline. Deterministic given ``seed``.
 
-        The torch / numpy global RNGs are saved, seeded locally from ``seed``,
-        and restored at the end — so the pipeline is fully reproducible given
-        the seed without disturbing the caller's RNG state.
+        Saves + locally seeds the torch/numpy global RNGs and restores them
+        at the end so the pipeline is reproducible without disturbing the
+        caller's RNG state.
         """
         rng = self._rng(seed)
-        # snapshot + locally seed the global RNGs for full determinism
         torch_state = torch.get_rng_state()
         torch_cuda_state = (torch.cuda.get_rng_state_all()
                             if torch.cuda.is_available() else None)
@@ -186,41 +158,32 @@ class RealESRGANDegrader:
         return img.clamp(0, 1)
 
     def _degrade_body(self, img: torch.Tensor, rng: random.Random) -> torch.Tensor:
-        B = img.shape[0]
-
-        # ── stage 1: blur (isotropic) ─────────────────────────────────────
         sigma1 = rng.uniform(*self.blur_sigma)
         img = _gaussian_blur(img, sigma1)
 
         order = [1, 2, 3, 4]  # 1=resize, 2=noise, 3=jpeg, 4=sinc
         if rng.random() < self.shuffle_prob:
             rng.shuffle(order)
-            # second-order: insert a second (aniso) blur somewhere
             second_blur = rng.random() < self.second_blur_prob
         else:
             second_blur = False
 
-        # ── stage 2: intermediate resize ───────────────────────────────────
         if rng.random() < self.resize_prob:
             scale = rng.uniform(0.15, 1.5)
             img = _resize_stage(img, rng, scale)
 
-        # ── stage 3: noise (Gaussian or Poisson) ────────────────────────────
         sigma_n = rng.uniform(*self.noise_sigma)
         poisson = rng.random() < 0.5
         img = _add_noise(img, sigma_n / 255.0, poisson, rng)
 
-        # ── stage 4: JPEG ──────────────────────────────────────────────────
         q = rng.randint(*self.jpeg_quality)
         img = _jpeg_compress(img, q)
 
-        # ── optional second (anisotropic) blur ────────────────────────────
         if second_blur:
             sx = rng.uniform(*self.blur_sigma)
             sy = rng.uniform(*self.blur_sigma)
             img = _aniso_blur(img, sx, sy)
 
-        # ── stage 5: final sinc filter ─────────────────────────────────────
         if rng.random() < self.sinc_prob:
             cutoff = rng.uniform(0.6, 0.99)
             img = _sinc_filter(img, cutoff)
@@ -228,17 +191,10 @@ class RealESRGANDegrader:
         return img.clamp(0, 1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience: HR patch → LR patch at the SR scale (the training-pair builder)
-# ─────────────────────────────────────────────────────────────────────────────
 def make_lr_pair(hr_patch: torch.Tensor, degrader: RealESRGANDegrader,
                  scale: int, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Given an HR patch (B,3,H,W) in [0,1], return (LR, HR) at the SR scale.
-
-    The HR patch is first degraded (Real-ESRGAN), then bicubic-downsampled by
-    ``scale`` to produce the LR input.  The HR target is the *original* clean
-    patch — this is the SR training pair.
-    """
+    """HR patch (B,3,H,W) in [0,1] → (LR, HR) at the SR scale.  HR target is
+    the original clean patch; LR is degraded + bicubic-downsampled by ``scale``."""
     degraded = degrader.degrade(hr_patch, seed=seed)
     H, W = hr_patch.shape[-2:]
     nh, nw = H // scale, W // scale

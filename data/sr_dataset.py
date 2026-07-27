@@ -1,46 +1,29 @@
 """Streaming SR dataset — HR image → random-crop 256² → on-the-fly degradation.
 
-Two modes:
-  * ``train``: random crop of ``patch_hr`` (256²), stochastic Real-ESRGAN
-    degradation (fresh seed per sample per epoch), returns (LR, HR) tensors
-    in [-1, 1] for both the latent path (HR encoded by VAE) and the refiner.
-  * ``val``  : full image (or centred crop to a multiple of ``scale``), fixed
-    degradation seed (reproducible PSNR/LPIPS — DESIGN §6 / EXECUTION-PLAN
-    acceptance criteria).
-
-HR images are read from a flat directory of ``*.png/.jpg/.webp`` and decoded
-lazily with ``PIL``. The heavy Real-ESRGAN pipeline runs on CPU in the worker.
+Two modes: ``train`` (random crop, stochastic degradation, fresh seed per
+sample per epoch) and ``val`` (centred crop to a multiple of ``scale``,
+fixed-seed degradation → reproducible PSNR/LPIPS).  HR images are read from a
+flat directory of ``*.png/.jpg/.webp`` and decoded lazily via PIL.
 """
 from __future__ import annotations
 
 import random
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch.utils.data import Dataset, DistributedSampler
+from PIL import Image
+from torchvision.transforms.functional import to_tensor
 
 from .realesrgan_degrade import RealESRGANDegrader, make_lr_pair
 
 
-def _pil_to_tensor(img) -> torch.Tensor:
-    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0  # (H,W,3)
-    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()        # (3,H,W) [0,1]
-
-
-def _to_minus1_to1(x: torch.Tensor) -> torch.Tensor:
-    return x * 2.0 - 1.0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Flat-directory HR source
-# ─────────────────────────────────────────────────────────────────────────────
 class _FlatDirHR(Dataset):
     """Lazily lists ``*.png/.jpg/.jpeg/.webp/.bmp`` under ``root`` (recursive)."""
 
     _EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
-    def __init__(self, root: str):
+    def __init__(self, root: "str | Path"):
         root = Path(root)
         if not root.exists():
             raise FileNotFoundError(f"HR image dir not found: {root}")
@@ -52,25 +35,14 @@ class _FlatDirHR(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        from PIL import Image
-        return _pil_to_tensor(Image.open(self.files[idx]))
+        return to_tensor(Image.open(self.files[idx]).convert("RGB"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SR pair dataset (wraps an HR source + degrader)
-# ─────────────────────────────────────────────────────────────────────────────
 class SRDataset(Dataset):
     """Returns (LR, HR) tensors in [-1, 1] at the configured patch size.
 
-    Args:
-        hr_root:  directory of HR images.
-        degrader: ``RealESRGANDegrader`` instance.
-        patch_hr: HR crop size (train). 256² default.
-        scale:    SR scale factor (4).
-        mode:     ``"train"`` (random crop, stochastic deg) or ``"val"``
-                  (centred crop to multiple of scale, fixed-seed deg).
-        base_seed: master seed — per-sample seed = base_seed + idx (+ epoch
-                  offset applied via ``set_epoch`` for train freshness).
+    ``mode="val"`` uses fixed-seed degradation for reproducible PSNR/LPIPS;
+    ``mode="train"`` uses a fresh per-sample, per-epoch seed.
     """
 
     def __init__(self, hr_root: str, degrader: RealESRGANDegrader,
@@ -96,16 +68,12 @@ class SRDataset(Dataset):
             hr = hr.unsqueeze(0)
         _, _, H, W = hr.shape
         if self.mode == "val":
-            # centred crop to the largest multiple of scale ≤ min(H,W)
             s = self.scale
             ch = (H // s) * s if H >= s else s
             cw = (W // s) * s if W >= s else s
-            ch = min(ch, self.patch_hr) if self.patch_hr > 0 else ch
-            cw = min(cw, self.patch_hr) if self.patch_hr > 0 else cw
             top = (H - ch) // 2
             left = (W - cw) // 2
             return hr[:, :, top:top + ch, left:left + cw]
-        # train: random crop
         ph = min(self.patch_hr, H)
         pw = min(self.patch_hr, W)
         top = random.randint(0, H - ph)
@@ -113,18 +81,14 @@ class SRDataset(Dataset):
         return hr[:, :, top:top + ph, left:left + pw]
 
     def __getitem__(self, idx):
-        hr = self._flat[idx]                       # (3,H,W) [0,1]
-        hr_crop = self._crop(hr.unsqueeze(0))      # (1,3,ph,pw)
-        # per-sample, per-epoch seed → fresh degradation each epoch (train)
+        hr = self._flat[idx]
+        hr_crop = self._crop(hr.unsqueeze(0))
         seed = self.base_seed + idx + self.epoch * 10_000_000
         lr, hr_pair = make_lr_pair(hr_crop, self.degrader, self.scale, seed)
-        lr_m1, hr_m1 = _to_minus1_to1(lr), _to_minus1_to1(hr_pair)
+        lr_m1, hr_m1 = (lr * 2.0 - 1.0), (hr_pair * 2.0 - 1.0)
         return {"lr": lr_m1.squeeze(0), "hr": hr_m1.squeeze(0), "seed": seed}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Distributed sampler
-# ─────────────────────────────────────────────────────────────────────────────
 class SRDistributedSampler(DistributedSampler):
     """Shards the SR dataset across DDP ranks, epoch-shuffled."""
 

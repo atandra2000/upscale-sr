@@ -18,7 +18,8 @@ from PIL import Image
 from utils.config import load_config
 from models import build_sr_unet, build_ssm_refiner, build_ddim
 from models.vae_frozen import load_frozen_vae
-from infer import upscale, _load_image, _save_image, _tensor_to_pil, load_image_pil
+from utils.memory import apply_channels_last
+from infer import upscale, _tensor_to_pil, load_image_pil
 
 
 def _bicubic_baseline(lr_img: torch.Tensor, scale: int) -> torch.Tensor:
@@ -38,9 +39,7 @@ def build_pipeline(cfg, ckpt_path, device, stub_vae=False):
         vae = load_frozen_vae(mcfg, device)
     unet = build_sr_unet(mcfg).to(device).eval()
     refiner = build_ssm_refiner(mcfg).to(device).eval()
-    if device.type == "cuda":
-        unet = unet.to(memory_format=torch.channels_last)
-        refiner = refiner.to(memory_format=torch.channels_last)
+    apply_channels_last(unet, refiner, device=device)
     unet.load_state_dict({k.removeprefix("unet."): v for k, v in sd.items()
                           if k.startswith("unet.")}, strict=False)
     refiner.load_state_dict({k.removeprefix("refiner."): v for k, v in sd.items()

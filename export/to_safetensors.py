@@ -1,20 +1,17 @@
 """Ship the final Upscale-SR checkpoint as a single safetensors file.
 
-    python export/to_safetensors.py --in <run>/sr_step_0100000.safetensors \
-        --out sr_x4_final.safetensors
-
-Takes a training checkpoint (U-Net + refiner weights) and writes the ship
-artifact ``sr_x4_final.safetensors`` (the file ``infer.py`` loads).  Optionally
-swaps in EMA shadow weights first (recommended — EMA is the inference model).
+Takes a training ckpt (U-Net + refiner weights), optionally swaps in EMA
+shadow weights, and writes ``sr_x4_final.safetensors`` (the file ``infer.py`` loads).
 """
 from __future__ import annotations
 
 import argparse
 
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from utils.config import load_config
+from utils.checkpoint import load_upsr_state
 from models import build_sr_unet, build_ssm_refiner
 from utils.stability import EMA
 
@@ -55,11 +52,9 @@ def main():
     unet = build_sr_unet(mcfg).to(device).eval()
     refiner = build_ssm_refiner(mcfg).to(device).eval()
 
-    sd = load_file(args.inp, device=str(device))
-    unet.load_state_dict({k.removeprefix("unet."): v for k, v in sd.items()
-                          if k.startswith("unet.")}, strict=False)
-    refiner.load_state_dict({k.removeprefix("refiner."): v for k, v in sd.items()
-                             if k.startswith("refiner.")}, strict=False)
+    unet_sd, refiner_sd = load_upsr_state(args.inp, device=str(device))
+    unet.load_state_dict(unet_sd, strict=False)
+    refiner.load_state_dict(refiner_sd, strict=False)
 
     from pathlib import Path
     if not args.no_ema:

@@ -1,14 +1,7 @@
 """Evaluation — PSNR / LPIPS on DIV2K-val (×4, Real-ESRGAN degradation, fixed seed).
 
-The eval pipeline (DESIGN §6 / EXECUTION-PLAN acceptance):
-  1. load val (LR, HR) pairs with a **fixed degradation seed** (reproducible);
-  2. run DDIM (30 steps) on the LR latent with **EMA** weights;
-  3. run the **refiner** (EMA) on the diffusion output image;
-  4. compute PSNR + LPIPS between the refined HR and the clean HR target.
-
-Used both as an in-loop eval (called from ``train.py`` every ``eval_every``
-iters) and as a standalone script (``python -m training.eval``) for the
-final reported number.
+DDIM+refiner with EMA weights; used both in-loop (every ``eval_every`` iters)
+and standalone (``python -m training.eval``).
 """
 from __future__ import annotations
 
@@ -22,6 +15,7 @@ import torch.distributed as dist
 from utils.config import load_config
 from utils.logging import is_main_process, setup_logger
 from utils.losses import build_lpips, lpips_loss_fn
+from utils.memory import apply_channels_last
 from data.sr_dataset import build_val_dataset
 from models import build_ddim, sr_cond_input
 
@@ -36,11 +30,7 @@ def _psnr(x: torch.Tensor, y: torch.Tensor, data_range: float = 1.0) -> float:
 
 @torch.no_grad()
 def _sr_inference(model, ddim, lr, device, steps=30):
-    """Run the full SR pipeline on one LR batch → HR image (B,3,H,W) in [0,1].
-
-    DDIM in latent space conditioned on the LR latent, then the refiner in
-    pixel space.
-    """
+    """Run DDIM+refiner on one LR batch → HR image (B,3,H,W) in [0,1]."""
     vae = model["vae"]
     unet = model["unet_compiled"]
     refiner = model["refiner_compiled"]
@@ -53,7 +43,7 @@ def _sr_inference(model, ddim, lr, device, steps=30):
     z = torch.randn(lr.shape[0], 4, Hl, Wl, device=device)
     ddim.set_timesteps(steps, device=device)
     for t in ddim.timesteps:
-        unet_in = sr_cond_input(lr_lat, z)
+        unet_in = sr_cond_input(lr_lat, z, up=unet.lr_up)
         eps = unet(unet_in, t.expand(lr.shape[0]))
         z = ddim.step(eps, t, z)
 
@@ -73,8 +63,7 @@ def evaluate(model, cfg, device, ema_unet=None, ema_refiner=None,
         return {"psnr": 0.0, "lpips": 0.0, "n": 0}
     lpips_fn = build_lpips(device)
 
-    # swap in EMA weights for inference
-    unet_raw = model["ddp_unet"] if hasattr(model["ddp_unet"], "module") else model["unet_compiled"]
+    unet_raw = model["unet_compiled"]
     backup_u = ema_unet.apply_shadow(unet_raw) if ema_unet is not None else {}
     backup_r = ema_refiner.apply_shadow(model["refiner_compiled"]) if ema_refiner is not None else {}
     try:
@@ -85,7 +74,6 @@ def evaluate(model, cfg, device, ema_unet=None, ema_refiner=None,
             lr = s["lr"].unsqueeze(0).to(device)
             hr01 = ((s["hr"] + 1) / 2).unsqueeze(0).to(device)
             out = _sr_inference(model, ddim, lr, device, steps=steps)
-            # crop to common size (decode may differ by ±1 px)
             H = min(out.shape[-2], hr01.shape[-2])
             W = min(out.shape[-1], hr01.shape[-1])
             psnrs.append(_psnr(out[..., :H, :W], hr01[..., :H, :W]))
@@ -121,20 +109,14 @@ def _main():
     vae = load_frozen_vae(mcfg, device)
     unet = build_sr_unet(mcfg).to(device).eval()
     refiner = build_ssm_refiner(mcfg).to(device).eval()
-    if torch.cuda.is_available():
-        unet = unet.to(memory_format=torch.channels_last)
-        refiner = refiner.to(memory_format=torch.channels_last)
+    apply_channels_last(unet, refiner, device=device)
 
-    # load weights
-    from safetensors.torch import load_file
-    sd = load_file(args.ckpt, device=str(device))
-    unet_sd = {k.removeprefix("unet."): v for k, v in sd.items() if k.startswith("unet.")}
-    ref_sd = {k.removeprefix("refiner."): v for k, v in sd.items() if k.startswith("refiner.")}
+    from utils.checkpoint import load_upsr_state
+    unet_sd, ref_sd = load_upsr_state(args.ckpt, device=str(device))
     unet.load_state_dict(unet_sd, strict=False)
     refiner.load_state_dict(ref_sd, strict=False)
 
-    model = {"vae": vae, "unet_compiled": unet, "refiner_compiled": refiner,
-             "ddp_unet": unet}
+    model = {"vae": vae, "unet_compiled": unet, "refiner_compiled": refiner}
     steps = args.steps or (cfg["model"]["scheduler"].get("fast_steps", 10) if args.fast
                           else cfg["model"]["scheduler"].get("infer_steps", 30))
     metrics = evaluate(model, cfg, device, ema_unet=None, ema_refiner=None,

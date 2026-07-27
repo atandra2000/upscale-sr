@@ -1,23 +1,8 @@
-"""SSM refiner — NAFNet-body U-Net with a ``mamba-ssm`` dilated bottleneck.
+"""SSM refiner — NAFNet-body U-Net with a mamba-ssm dilated bidirectional bottleneck.
 
-(DESIGN §1.3 / candidate §3.2.)
-
-Why a refiner: latent-diffusion SR over-smooths high frequencies.  A
-lightweight pixel-space refiner runs **after** the diffusion pass to
-re-inject sharp detail.  Its bottleneck is a **bidirectional selective scan**
-(``mamba-ssm``) with **dilated multi-scan** (strides {1,2,4}, reflect-pad
-wrap, summed) — the dilated-conv analog for SSMs (SRMamba arXiv:2403.11143).
-
-Kernels (vision-research README §4.2 — optimised over pure PyTorch):
-  * fast path: ``mamba_ssm.selective_scan_fn`` (Blackwell sm_120 build).
-  * fallback  : pure-PyTorch chunkwise scan (correct, slower; time is no
-    concern — the suite keeps pure-PyTorch only as a fallback).
-
-~20 M params, d=64, runs at the diffusion output resolution (256² train /
-2048² inference, tileable).
-
-The kernel-equivalence test (``tests/test_refiner_shapes.py``) asserts the
-fast path ≡ fallback on a toy input.
+~23 M params, runs at the diffusion output resolution (256² train / 2048²
+inference, tileable).  Fast path: ``mamba_ssm.selective_scan_fn``; fallback:
+pure-PyTorch chunkwise scan (kernel-equivalence tested in test_refiner_shapes).
 """
 from __future__ import annotations
 
@@ -26,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-# ── mamba-ssm availability probe (done once) ─────────────────────────────────
 try:
     from mamba_ssm import selective_scan_fn as _ss_fn  # type: ignore
     _HAS_MAMBA = True
@@ -43,32 +27,15 @@ def mamba_available() -> bool:
 # Selective scan — fast path (mamba-ssm) + pure-PyTorch fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 def selective_scan(x, dt, A, B, C):
-    """Selective SSM scan.
+    """Selective SSM scan (zoh): A_bar = exp(Δ·A), h_t = A_bar·h_{t-1} + B·x_t, y_t = C·h_t.
 
-    Discretised recurrence (zoh):  A_bar = exp(Δ · A),  h_t = A_bar·h_{t-1} + B·x_t,
-    y_t = C · h_t.
-
-    Args (fallback convention — channels-last sequence):
-        x : (B, L, D)        input sequence (per-head feature)
-        dt : (B, L, 1)       input-dependent step (gates the recurrence)
-        A : (D,)  or (B,L,D)  log-decay (negative ⇒ decay); broadcastable
-        B : (B, L, N)        input-dependent B matrix
-        C : (B, L, N)        input-dependent C matrix
-    Returns:
-        y : (B, L, D)        SSM output
-
-    The fast path uses ``mamba_ssm.selective_scan_fn`` which expects
-    ``(B, L, D, N)`` layout for x/B/C and a separate ``delta`` arg; we wrap it
-    so callers use the simpler (B,L,*) convention.
+    x:(B,L,D), dt:(B,L,1), A:(D,) or (B,L,D), B:(B,L,N), C:(B,L,N) → y:(B,L,D).
+    Fast path wraps ``mamba_ssm.selective_scan_fn`` (transposes to its layout).
     """
     Bsz, L, D = x.shape
     N = B.shape[-1]
 
     if _HAS_MAMBA and x.is_cuda:
-        # mamba-ssm expects: u (B,D,L), delta (B,L,1)->(B,1,L) but we just feed (B,L)
-        # Layout it wants: u (B, D, L), delta (B, L, 1) is acceptable as (B, L).
-        # We follow the documented signature: selective_scan_fn(u, delta, A, B, C)
-        # where u:(B,D,L), delta:(B,L,1), A:(D), B:(B,N,L), C:(B,N,L).
         u = x.transpose(1, 2).contiguous()                       # (B, D, L)
         delta = dt.contiguous()                                  # (B, L, 1)
         A_ = A.contiguous() if A.dim() == 1 else A[..., 0].contiguous()  # (D,)
@@ -99,25 +66,9 @@ def selective_scan(x, dt, A, B, C):
     return y
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Bidirectional dilated multi-scan bottleneck (SRMamba-style)
-# ═══════════════════════════════════════════════════════════════════════════════
 class DilatedBiSSM(nn.Module):
-    """Bidirectional selective scan with **dilated multi-scan**.
-
-    For each stride ``s`` in ``dilations``:
-      1. reflect-pad the flattened sequence by ``s`` on both ends,
-      2. take the strided subsequence (positions 0, s, 2s, …),
-      3. run a forward + a backward selective scan,
-      4. scatter the scanned values back to their original positions,
-      5. sum across strides.
-
-    This is the dilated-conv analog for SSMs: each stride captures a
-    different receptive field, and the sum aggregates them.  The
-    reflect-pad wrap-around avoids boundary artifacts.
-
-    Input/Output: (B, C, H, W) feature map.
-    """
+    """Bidirectional selective scan with dilated multi-scan (the dilated-conv
+    analog for SSMs).  Input/output: (B, C, H, W)."""
 
     def __init__(self, channels: int, state_dim: int = 16,
                  dilations: tuple = (1, 2, 4)):
@@ -138,22 +89,9 @@ class DilatedBiSSM(nn.Module):
         return selective_scan(x, dt, A, B, C)
 
     def _dilated_scan(self, x_seq, dt, B, C, A, stride):
-        """Bidirectional dilated scan over a (B, L, D) sequence.
-
-        For stride ``s`` the sequence is partitioned into ``s`` interleaved
-        subsequences (positions ``g, g+s, g+2s, …`` for each offset ``g``);
-        each subsequence is scanned forward + backward, and the results are
-        scattered back to their original positions and summed.  This is the
-        dilated-conv analog for SSMs: each stride gives a different receptive
-        field (s=1 → dense local, s=4 → 4× longer range), and the multi-scan
-        sum (over ``self.dilations``) aggregates them.
-        """
+        """Bidirectional dilated scan over (B, L, D): stride-s interleaved
+        subsequences, each scanned fwd+rev, scattered back and summed."""
         Bsz, L, D = x_seq.shape
-        if stride == 1:
-            fwd = self._scan_direction(x_seq, dt, B, C, A)
-            rev = self._scan_direction(x_seq.flip(1), dt.flip(1),
-                                       B.flip(1), C.flip(1), A).flip(1)
-            return fwd + rev
         out = torch.zeros_like(x_seq)
         for g in range(stride):
             pos = torch.arange(g, L, stride, device=x_seq.device)   # (Lg,)
@@ -169,26 +107,37 @@ class DilatedBiSSM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
-        # (B, C, H, W) → (B, L, D)  with L = H*W, D = C
-        seq = x.view(b, c, h * w).transpose(1, 2)              # (B, L, D)
-        proj = self.in_proj(seq)                                # (B, L, D+2N+1)
+        # 1. Horizontal scan sequence (B, L, D)  with L = H*W, D = C
+        seq = x.view(b, c, h * w).transpose(1, 2)
+        proj = self.in_proj(seq)
         dt = proj[..., :1]
         Bm = proj[..., 1:1 + self.state_dim]
         Cm = proj[..., 1 + self.state_dim:1 + 2 * self.state_dim]
         xs = proj[..., 1 + 2 * self.state_dim:]
-        out = torch.zeros_like(seq)
+        out_h = torch.zeros_like(seq)
         for s in self.dilations:
-            out = out + self._dilated_scan(xs, dt, Bm, Cm, self.A, s)
+            out_h = out_h + self._dilated_scan(xs, dt, Bm, Cm, self.A, s)
+
+        # 2. Vertical scan sequence (B, L, D) via grid transpose (H, W) → (W, H)
+        v_x = x.transpose(2, 3).reshape(b, c, h * w).transpose(1, 2)
+        v_proj = self.in_proj(v_x)
+        v_dt = v_proj[..., :1]
+        v_Bm = v_proj[..., 1:1 + self.state_dim]
+        v_Cm = v_proj[..., 1 + self.state_dim:1 + 2 * self.state_dim]
+        v_xs = v_proj[..., 1 + 2 * self.state_dim:]
+        out_v = torch.zeros_like(v_x)
+        for s in self.dilations:
+            out_v = out_v + self._dilated_scan(v_xs, v_dt, v_Bm, v_Cm, self.A, s)
+        out_v_seq = out_v.transpose(1, 2).view(b, c, w, h).transpose(2, 3).reshape(b, c, h * w).transpose(1, 2)
+
+        out = out_h + out_v_seq
         out = self.out_norm(out.transpose(1, 2).view(b, c, h, w))
         out = out.view(b, c, h * w).transpose(1, 2)
         out = self.out_proj(out)
-        out = out.transpose(1, 2).view(b, c, h, w)              # (B, C, H, W)
+        out = out.transpose(1, 2).view(b, c, h, w)
         return out + x  # residual
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NAFNet-style building blocks
-# ═══════════════════════════════════════════════════════════════════════════════
 class SimpleGate(nn.Module):
     """Split a tensor in half along the channel dim and multiply — NAFNet gate."""
 
@@ -233,16 +182,8 @@ class NAFBlock(nn.Module):
         return self._forward(x)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SSM refiner — NAFNet-body U-Net + dilated BiSSM bottleneck
-# ═══════════════════════════════════════════════════════════════════════════════
 class SSMRefiner(nn.Module):
-    """Pixel-space refiner.  Input/output: (B, 3, H, W) image in [-1, 1].
-
-    Encoder: 3×3 conv → NAF blocks at each resolution, downsample by 2 twice.
-    Bottleneck: NAF blocks + ``DilatedBiSSM``.
-    Decoder: NAF blocks + bilinear upsample, skip-concat from encoder.
-    """
+    """Pixel-space refiner: (B,3,H,W) → (B,3,H,W).  NAFNet-body U-Net + DilatedBiSSM bottleneck."""
 
     def __init__(self, in_ch: int = 3, base_ch: int = 64,
                  ch_mults: tuple = (1, 2, 4),
@@ -259,7 +200,6 @@ class SSMRefiner(nn.Module):
 
         self.conv_in = nn.Conv2d(in_ch, ch[0], 3, padding=1)
 
-        # ── Encoder: blocks at each level, downsample between levels ───────
         self.encoders = nn.ModuleList()
         self.downs = nn.ModuleList()
         for i in range(self.levels):
@@ -268,7 +208,6 @@ class SSMRefiner(nn.Module):
             if i < self.levels - 1:
                 self.downs.append(nn.Conv2d(ch[i], ch[i + 1], 3, stride=2, padding=1))
 
-        # ── Bottleneck at the deepest level: NAF blocks + SSM + NAF ────────
         cur = ch[-1]
         self.bottleneck = nn.Sequential(
             *[NAFBlock(cur, grad_ckpt=grad_ckpt) for _ in range(num_blocks[-1])])
@@ -276,20 +215,20 @@ class SSMRefiner(nn.Module):
                                dilations=ssm_dilated_strides)
         self.mid_block = NAFBlock(cur, grad_ckpt=grad_ckpt)
 
-        # ── Decoder: upsample + skip-concat + 1×1 reduce + blocks ──────────
         self.ups = nn.ModuleList()
         self.skip_reduce = nn.ModuleList()
         self.decoders = nn.ModuleList()
-        for i in reversed(range(self.levels - 1)):       # deepest-1 … 0
-            self.ups.append(nn.Conv2d(cur, ch[i], 3, padding=1))            # channel-reduce
-            self.skip_reduce.append(nn.Conv2d(ch[i] * 2, ch[i], 1))       # fold skip
+        for i in reversed(range(self.levels - 1)):
+            self.ups.append(nn.Conv2d(cur, ch[i], 3, padding=1))
+            self.skip_reduce.append(nn.Conv2d(ch[i] * 2, ch[i], 1))
             self.decoders.append(nn.Sequential(
                 *[NAFBlock(ch[i], grad_ckpt=grad_ckpt) for _ in range(num_blocks[i])]))
             cur = ch[i]
 
         self.norm_out = nn.GroupNorm(1, ch[0])
         self.conv_out = nn.Conv2d(ch[0], in_ch, 3, padding=1)
-        nn.init.zeros_(self.conv_out.weight)  # refiner starts as identity
+        self.gamma_hf = nn.Parameter(torch.zeros(1))
+        nn.init.zeros_(self.conv_out.weight)
         nn.init.zeros_(self.conv_out.bias)
 
     def enable_gradient_checkpointing(self):
@@ -298,9 +237,21 @@ class SSMRefiner(nn.Module):
             if isinstance(m, NAFBlock):
                 m.grad_ckpt = True
 
+    def _haar_dwt_high_pass(self, x: torch.Tensor) -> torch.Tensor:
+        """2D Haar DWT high-pass extraction (LH, HL, HH sub-bands)."""
+        if x.shape[-2] % 2 != 0 or x.shape[-1] % 2 != 0:
+            return torch.zeros_like(x)
+        x00, x10 = x[..., 0::2, 0::2], x[..., 1::2, 0::2]
+        x01, x11 = x[..., 0::2, 1::2], x[..., 1::2, 1::2]
+        lh = (-x00 - x10 + x01 + x11) * 0.5
+        hl = (-x00 + x10 - x01 + x11) * 0.5
+        hh = (x00 - x10 - x01 + x11) * 0.5
+        return F.interpolate(lh + hl + hh, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Refine a diffusion-output image. (B,3,H,W) → (B,3,H,W)."""
         res = x
+        hf_detail = self._haar_dwt_high_pass(x)
         h = self.conv_in(x)
         skips = []
         for i in range(self.levels):
@@ -318,7 +269,7 @@ class SSMRefiner(nn.Module):
             h = blocks(h)
         h = F.silu(self.norm_out(h))
         h = self.conv_out(h)
-        return h + res  # global residual → refiner = identity at init
+        return h + res + self.gamma_hf * hf_detail  # global residual + learned Haar detail
 
 
 def build_ssm_refiner(cfg: dict) -> SSMRefiner:

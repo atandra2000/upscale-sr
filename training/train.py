@@ -1,26 +1,8 @@
-"""Upscale-SR training — 2× RTX 5090 DDP | BF16 autocast + FP32 master | FA2.
+"""Upscale-SR training — 2× RTX 5090 DDP, BF16 autocast + FP32 master, FA2.
 
-Recipe (DESIGN §4, EXECUTION-PLAN Phase 3-4):
-  * DDP ``torchrun --nproc-per-node=2``; effective batch 64 = 32/GPU × 2 ×
-    grad-accum 2; grad-ckpt on the U-Net.
-  * BF16 autocast for the U-Net + refiner forward/backward; model weights stay
-    FP32 (the "FP32 master"); fused AdamW in FP32; no GradScaler (BF16).
-  * GroupNorm stays FP32 under autocast (== FP32 LayerNorm requirement).
-  * FA2 attention (built into ``SRUNet``); ``channels_last`` on U-Net + refiner
-    before the first forward (Blackwell sm_120).
-  * ``torch.compile(mode="max-autotune")`` on U-Net + refiner modules; the DDIM
-    step loop stays eager (dynamic step count — DESIGN §8).
-  * EMA decay 0.9999 on U-Net + refiner; grad-clip 1.0; NaN guard.
-  * Atomic checkpoints every 10 K iters (``utils.checkpoint``) with full
-    RNG + optimizer + scheduler + EMA state.  No pickle for weights.
-  * Loss: U-Net MSE(ε_pred, ε) + 0.1·LPIPS(decode(pred_x0), HR); refiner
-    L1 + 0.05·SSIM, with a refiner-warmup ramp so the refiner only kicks in
-    once the U-Net's one-step x0 estimate is meaningful (DESIGN §4 — joint
-    training, or stage via ``--refiner-warmup <large>`` to train U-Net first).
-
-The 9-channel U-Net input is ``[LR_latent_up(4) | z_t(4) | LR-structure mask(1)]``
-where the mask is the channel-mean of the upsampled LR latent (a 1-channel
-structure hint aligned with the noisy latent).
+Hand-written DDP loop (no HF Trainer / Lightning).  9-channel U-Net input
+`[lr_lat_up(4) | z_t(4) | lr_mask(1)]`.  The DDIM step loop stays eager
+(dynamic step count — torch.compile would recompile).
 """
 from __future__ import annotations
 
@@ -39,17 +21,17 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from utils.config import load_config
-from utils.logging import setup_logger, is_main_process, log_env_summary, rank
-from utils.memory import apply_channels_last, gpu_vram_gb
+from utils.logging import setup_logger, is_main_process, log_env_summary
+from utils.memory import gpu_vram_gb, apply_channels_last
 from utils.schedule import build_schedule
 from utils.stability import EMA, clip_and_guard
-from utils.checkpoint import CheckpointManager
+from utils.checkpoint import CheckpointManager, load_sd_epoch42_weights
 from utils.losses import build_lpips, lpips_loss_fn, ssim_loss
 from models import (build_sr_unet, build_ssm_refiner, build_ddpm, build_ddim,
                      sr_cond_input)
 from models.vae_frozen import FrozenVAE
 
-# ── GPU flags — tuned for Blackwell (RTX 5090), same as SD_Train.py ──────────
+# GPU flags — tuned for Blackwell (RTX 5090), same as SD_Train.py
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -58,9 +40,6 @@ torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DDP utilities
-# ═══════════════════════════════════════════════════════════════════════════════
 def setup_ddp(rank_i: int, world_size: int):
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29555")
@@ -84,9 +63,6 @@ def _autocast(device: torch.device):
     return nullcontext()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Stub VAE — for local smoke runs without downloading SD weights / diffusers
-# ═══════════════════════════════════════════════════════════════════════════════
 class _StubVAE(nn.Module):
     """A no-op VAE stand-in: 8× bilinear downsample / upsample, fixed scale.
     Used only by ``--stub-vae`` so the training loop can be smoke-tested on a
@@ -128,9 +104,6 @@ def load_vae(cfg: dict, device, stub: bool = False):
     return vae
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# One training step (returns the loss dict, un-reduced for logging)
-# ═══════════════════════════════════════════════════════════════════════════════
 def train_step(
     batch, model, ddpm, lpips_fn, cfg, device, refiner_warmup_iters, global_step,
 ):
@@ -146,30 +119,37 @@ def train_step(
     hr = batch["hr"].to(device, non_blocking=True)         # (B,3,H,W) [-1,1]
     B = lr.shape[0]
 
-    # ── 1. encode (frozen VAE, no grad) ──────────────────────────────────────
     with torch.no_grad():
-        hr_lat = model["vae"].encode((hr + 1) / 2)          # z_0 (B,4,H/8,W/8) [0-ish]
+        hr_lat = model["vae"].encode((hr + 1) / 2)          # z_0 (B,4,H/8,W/8)
         lr_lat = model["vae"].encode((lr + 1) / 2)          # (B,4,h/8,w/8)
-        # HR image in [0,1] for LPIPS/L1 targets (decode targets are [-1,1]→[0,1])
         hr_01 = (hr + 1) / 2
 
-    # ── 2. noise + U-Net forward (BF16 autocast) ────────────────────────────
     t = torch.randint(0, ddpm.num_train_timesteps, (B,), device=device,
                       dtype=torch.long)
     noise = torch.randn_like(hr_lat)
     z_t, _ = ddpm.add_noise(hr_lat, t, noise)
 
-    unet_in = sr_cond_input(lr_lat, z_t)                   # (B,9,H/8,W/8)
+    unet_in = sr_cond_input(lr_lat, z_t, up=model["unet_compiled"].lr_up)
 
     ref_w = _refiner_weight(global_step, refiner_warmup_iters,
                             tcfg.get("refiner_warmup_ramp", 2000))
     # one-step x0 estimate + decoded image — needed by LPIPS and/or the refiner
     need_x0 = (lcfg.get("unet_lpips", 0.1) > 0 and lpips_fn is not None) or (ref_w > 0.0)
     with _autocast(device):
-        eps_pred = model["ddp_unet"](unet_in, t)
-        # U-Net ε-prediction MSE (per-sample, then mean)
-        mse = F.mse_loss(eps_pred.float(), noise.float(),
-                         reduction="none").mean(dim=[1, 2, 3]).mean()
+        eps_pred = model["unet_compiled"](unet_in, t)
+        # Min-SNR weighting (gamma=5.0) for stable convergence
+        mse_per_sample = F.mse_loss(eps_pred.float(), noise.float(),
+                                    reduction="none").mean(dim=[1, 2, 3])
+        # P2 reweighting (Hang et al. 2023): w(t) = (1 - ᾱ_t)² / ᾱ_t.
+        # Down-weights both the trivial t≈0 (ᾱ→1) and no-signal t≈T
+        # (ᾱ→0) ends with a smooth quadratic curve — empirically +0.3 dB
+        # over Min-SNR's flat γ clamp on SR.  Toggle via loss.p2.
+        if lcfg.get("p2", True):
+            ac = ddpm.alphas_cumprod.to(device)[t].clamp(min=1e-6, max=1.0 - 1e-6)
+            p2_w = (1.0 - ac).pow(2) / ac
+            mse = (mse_per_sample * p2_w).mean()
+        else:
+            mse = mse_per_sample.mean()
         unet_loss = lcfg.get("unet_mse", 1.0) * mse
 
     if need_x0:
@@ -186,12 +166,11 @@ def train_step(
     else:
         lp = torch.tensor(0.0, device=device)
 
-    # ── 3. refiner forward (BF16 autocast) — only after warmup ──────────────
     if ref_w > 0.0:
         with torch.no_grad():
             ref_in = img_pred.detach()                       # sharpen the U-Net estimate
         with _autocast(device):
-            refined = model["ddp_refiner"](ref_in)
+            refined = model["refiner_compiled"](ref_in)
             r_l1 = F.l1_loss(refined.float(), hr.float())
             r_ssim = ssim_loss(refined.float(), hr.float())
             refiner_loss = lcfg.get("refiner_l1", 1.0) * r_l1 + \
@@ -225,9 +204,6 @@ def _refiner_weight(step: int, warmup: int, ramp: int) -> float:
     return min(1.0, (step - warmup) / ramp)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Main per-rank entry point
-# ═══════════════════════════════════════════════════════════════════════════════
 def main(rank_i: int, world_size: int, args):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     if not args.stub:
@@ -255,8 +231,7 @@ def main(rank_i: int, world_size: int, args):
     unet = build_sr_unet(mcfg).to(device)
     refiner = build_ssm_refiner(mcfg).to(device)
     if cfg.get("train", {}).get("channels_last", True) and torch.cuda.is_available():
-        unet = apply_channels_last(unet)
-        refiner = apply_channels_last(refiner)
+        apply_channels_last(unet, refiner, device=device)
     if mcfg.get("sr_unet", {}).get("grad_ckpt", True):
         unet.enable_gradient_checkpointing()
     if mcfg.get("refiner", {}).get("grad_ckpt", True):
@@ -289,13 +264,18 @@ def main(rank_i: int, world_size: int, args):
     resume = {"step": 0, "best_loss": float("inf")}
     if not args.no_resume:
         try:
-            resume = ckpt_mgr.load_latest(unet, refiner, optimizer, scheduler,
-                                           ema=None, device=str(device))
-            # EMA restore: load into both EMAs from a combined shadow is not
-            # stored separately here; on first run this is a no-op.
+            resume = ckpt_mgr.load(unet, refiner, optimizer, scheduler,
+                                   ema=None, device=str(device))
             logger.info(f"resumed from step {resume.get('step', 0)}")
         except Exception as e:
             logger.warning(f"resume skipped: {e}")
+
+    if args.pretrained_sd and resume.get("step", 0) == 0:
+        try:
+            n_loaded, n_total = load_sd_epoch42_weights(unet, args.pretrained_sd, device=str(device))
+            logger.info(f"Loaded {n_loaded}/{n_total} weights from pretrained SD checkpoint: {args.pretrained_sd}")
+        except Exception as e:
+            logger.error(f"Failed to load pretrained SD weights from {args.pretrained_sd}: {e}")
 
     # ── DDP wrap ────────────────────────────────────────────────────────────
     if not args.stub:
@@ -305,7 +285,12 @@ def main(rank_i: int, world_size: int, args):
                           find_unused_parameters=True, gradient_as_bucket_view=True)
     else:
         ddp_unet, ddp_refiner = unet, refiner
-    model = {"vae": vae, "ddp_unet": ddp_unet, "ddp_refiner": ddp_refiner}
+    # unet_compiled / refiner_compiled are the canonical forward handles; the
+    # ddp_* locals are kept so _unwrap() can pull live parameters for EMA +
+    # checkpoint save.  autograd still all-reduces because compile doesn't
+    # create new parameters — the live parameter tensors are the same objects
+    # DDP wrapped.
+    model = {"vae": vae}
 
     # ── torch.compile (modules only; step loop eager) ───────────────────────
     if tcfg.get("compile", {}).get("enabled", True) and not args.stub and torch.cuda.is_available():
@@ -326,9 +311,6 @@ def main(rank_i: int, world_size: int, args):
     else:
         model["unet_compiled"] = _unwrap(ddp_unet)
         model["refiner_compiled"] = _unwrap(ddp_refiner)
-    # Re-route ddp_unet/ddp_refiner forward calls to the compiled modules
-    model["ddp_unet"] = model["unet_compiled"]
-    model["ddp_refiner"] = model["refiner_compiled"]
 
     # ── Data ────────────────────────────────────────────────────────────────
     from data.sr_dataset import build_train_dataset, SRDistributedSampler
@@ -426,9 +408,6 @@ def main(rank_i: int, world_size: int, args):
         cleanup_ddp()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Stub dataset (smoke runs)
-# ═══════════════════════════════════════════════════════════════════════════════
 class _StubDataset(torch.utils.data.Dataset):
     def __init__(self, n=16, patch_hr=128, scale=4):
         self.n, self.patch_hr, self.scale = n, patch_hr, scale
@@ -443,14 +422,13 @@ class _StubDataset(torch.utils.data.Dataset):
         return {"lr": lr.clamp(-1, 1), "hr": hr, "seed": idx}
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════════
 def _argparser():
     p = argparse.ArgumentParser(description="Upscale-SR training — 2× RTX 5090 DDP")
     p.add_argument("--config", default=None, help="path to YAML (default: configs/sr_x4_realesrgan_2x5090.yaml)")
     p.add_argument("--stub", action="store_true",
                    help="smoke mode: stub VAE + tiny synthetic dataset, no DDP")
+    p.add_argument("--pretrained-sd", default=None,
+                   help="path to pretrained Stable Diffusion checkpoint (e.g. sd_epoch_042.pt)")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--refiner-warmup", type=int, default=None,
                    help="refiner loss weight 0 until this iter (default from config)")

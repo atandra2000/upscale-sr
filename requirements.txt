@@ -5,26 +5,18 @@
 # pure-PyTorch / sdpa fallback runs (correct, slower) — time is not a concern.
 #
 #   pip install -r requirements.txt
-#   # if flash-attn wheel missing for sm_120:
-#   pip install flash-attn --no-build-isolation
+#   # optional — Blackwell-only kernels (skip if a build fails):
+#   pip install flash-attn mamba-ssm causal-conv1d
 
 torch>=2.12
 numpy
 pillow
 pyyaml
 safetensors
-# ── kernels (Blackwell sm_120 builds; fallback if unavailable) ──────────────
-# flash-attn          # FA2 U-Net attention
-# mamba-ssm           # SSM refiner bottleneck selective scan
-# causal-conv1d       # companion to mamba-ssm
-# ── model / data / loss / eval ──────────────────────────────────────────────
 diffusers>=0.30        # frozen SD1.5 VAE (AutoencoderKL)
-transformers           # only if a CLIP/feature backbone is needed later
 torchvision            # VGG16 LPIPS fallback
 webdataset             # HR shards (.tar) — flat-dir fallback works without it
 lpips                  # perceptual loss (VGG fallback if missing)
-# ── product surface ─────────────────────────────────────────────────────────
 gradio                 # before/after demo
 onnx                   # refiner ONNX export
 onnxruntime            # ONNX round-trip verification
-wandb                  # optional experiment tracking

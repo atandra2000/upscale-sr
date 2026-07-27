@@ -1,12 +1,7 @@
 """Upscale-SR — product inference CLI.
 
-    python infer.py --in lr.jpg --out sr.png --scale 4 [--steps 30] [--fast]
-
-Loads the shipped ``sr_x4_final.safetensors`` + the frozen SD1.5 VAE, runs
-DDIM (30 steps; 10 with ``--fast``) in latent space conditioned on the LR
-latent, then the SSM refiner in pixel space, and writes the 4× HR image.
-
-Target: ~1.5 s for 512²→2048² on one RTX 5090 (DESIGN §5 / candidate §1).
+Loads ``sr_x4_final.safetensors`` + the frozen SD1.5 VAE, runs DDIM in latent
+space + the SSM refiner in pixel space, writes the 4× HR image.
 """
 from __future__ import annotations
 
@@ -21,16 +16,11 @@ import torch.nn.functional as F
 from PIL import Image
 
 from utils.config import load_config
-from models import build_sr_unet, build_ssm_refiner, build_ddim, sr_cond_input
+from utils.checkpoint import load_upsr_state
+from models import (build_sr_unet, build_ssm_refiner, build_ddim, build_dpm_solver,
+                    sr_cond_input)
 from models.vae_frozen import load_frozen_vae
-
-
-def _load_image(path: str) -> torch.Tensor:
-    """Load an image → (1,3,H,W) in [-1,1]."""
-    import numpy as np
-    img = Image.open(path).convert("RGB")
-    arr = torch.from_numpy(np.asarray(img).copy()).permute(2, 0, 1).unsqueeze(0).float() / 127.5 - 1.0
-    return arr
+from utils.memory import apply_channels_last
 
 
 def load_image_pil(img: Image.Image) -> torch.Tensor:
@@ -61,9 +51,8 @@ def _safe_reflect_pad(x: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
     """Reflect-pad the right/bottom of ``x`` by (pad_h, pad_w).
 
     torch's ``reflect`` mode requires pad < dim, which breaks for inputs
-    smaller than the pad amount (e.g. a 16×16 LR padded to 32).  Reflect as
-    much as possible (dim-1), then constant-pad the remainder to reach the
-    target multiple.  Returns the padded tensor.
+    smaller than the pad amount.  Reflect as much as possible (dim-1), then
+    constant-pad the remainder.
     """
     _, _, H, W = x.shape
     rh = min(pad_h, max(H - 1, 0))
@@ -83,9 +72,7 @@ def upscale(
 ) -> torch.Tensor:
     """Run the full SR pipeline on (1,3,h,w) in [-1,1] → (1,3,H,W) in [-1,1].
 
-    Large images are tiled (``crop`` > 0) to bound VRAM — each tile is
-    ``crop``×``crop`` in the LR, SR'd independently, and blended with a
-    25%-overlap cosine window.  ``crop=0`` runs the whole image at once.
+    ``crop > 0`` tiles large images (hann-window blend, 25% overlap) to bound VRAM.
     """
     _, _, h, w = lr_img.shape
     if crop and (h > crop or w > crop):
@@ -109,7 +96,7 @@ def upscale(
     z = torch.randn(1, 4, Hl, Wl, device=device)
     ddim.set_timesteps(steps, device=device)
     for t in ddim.timesteps:
-        eps = unet(sr_cond_input(lr_lat, z), t.expand(1))
+        eps = unet(sr_cond_input(lr_lat, z, up=unet.lr_up), t.expand(1))
         z = ddim.step(eps, t, z)
     img = vae.decode(z)            # (1,3,H,W) [-1,1]
     refined = refiner(img)
@@ -125,23 +112,21 @@ def _tile_upscale(lr_img, unet, refiner, vae, ddim, device, scale, steps, crop):
     out_H, out_W = H * scale, W * scale
     acc = torch.zeros(1, 3, out_H, out_W, device=device)
     wsum = torch.zeros(1, 1, out_H, out_W, device=device)
-    # cosine-bell 2-D blending window
     win1d = torch.hann_window(crop, device=device)
-    win2d = win1d[:, None] * win1d[None, :]           # (crop, crop)
-    win2d = win2d.unsqueeze(0).unsqueeze(0)           # (1,1,crop,crop)
+    win2d = win1d[:, None] * win1d[None, :]
+    win2d = win2d.unsqueeze(0).unsqueeze(0)
+    # interpolate once — same args for acc and wsum
+    win2d_up = F.interpolate(win2d, scale_factor=scale, mode="bilinear",
+                             align_corners=False)
     for y in range(0, H, stride):
         for x in range(0, W, stride):
             y1 = min(y, H - crop); x1 = min(x, W - crop)
             tile = lr_img[:, :, y1:y1 + crop, x1:x1 + crop]
             sr_tile = upscale(tile, unet, refiner, vae, ddim, device,
-                              scale, steps, crop=0)
+                               scale, steps, crop=0)
             sy, sx = y1 * scale, x1 * scale
-            acc[:, :, sy:sy + crop * scale, sx:sx + crop * scale] += \
-                sr_tile * F.interpolate(win2d, scale_factor=scale,
-                                        mode="bilinear", align_corners=False)
-            wsum[:, :, sy:sy + crop * scale, sx:sx + crop * scale] += \
-                F.interpolate(win2d, scale_factor=scale, mode="bilinear",
-                              align_corners=False)
+            acc[:, :, sy:sy + crop * scale, sx:sx + crop * scale] += sr_tile * win2d_up
+            wsum[:, :, sy:sy + crop * scale, sx:sx + crop * scale] += win2d_up
     return acc / wsum.clamp(min=1e-6)
 
 
@@ -150,8 +135,10 @@ def main():
     ap.add_argument("--in", dest="inp", required=True, help="input LR image")
     ap.add_argument("--out", required=True, help="output HR image path")
     ap.add_argument("--scale", type=int, default=4)
-    ap.add_argument("--steps", type=int, default=None, help="DDIM steps (default from cfg: 30)")
+    ap.add_argument("--steps", type=int, default=None, help="DDIM/DPM++ steps (default from cfg: 30)")
     ap.add_argument("--fast", action="store_true", help="10-step fast mode")
+    ap.add_argument("--sampler", choices=["ddim", "dpm++"], default="dpm++",
+                    help="inference ODE sampler (dpm++ [2x faster] or ddim)")
     ap.add_argument("--ckpt", default=None, help="safetensors ckpt (default from cfg)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--crop", type=int, default=512,
@@ -167,10 +154,7 @@ def main():
     icfg = cfg.get("infer", {})
 
     ckpt_path = args.ckpt or icfg.get("ckpt", "sr_x4_final.safetensors")
-    print(f"[upscale-sr] device={device} | ckpt={ckpt_path}")
-    from safetensors.torch import load_file
-    sd = load_file(ckpt_path, device=str(device))
-
+    print(f"[upscale-sr] device={device} | ckpt={ckpt_path} | sampler={args.sampler}")
     if args.stub_vae:
         from training.train import _StubVAE
         vae = _StubVAE().to(device)
@@ -179,23 +163,26 @@ def main():
     unet = build_sr_unet(mcfg).to(device).eval()
     refiner = build_ssm_refiner(mcfg).to(device).eval()
     if device.type == "cuda":
-        unet = unet.to(memory_format=torch.channels_last)
-        refiner = refiner.to(memory_format=torch.channels_last)
-    unet.load_state_dict({k.removeprefix("unet."): v for k, v in sd.items()
-                          if k.startswith("unet.")}, strict=False)
-    refiner.load_state_dict({k.removeprefix("refiner."): v for k, v in sd.items()
-                             if k.startswith("refiner.")}, strict=False)
+        apply_channels_last(unet, refiner, device=device)
+    # Shape-filter load tolerates channel-count drift in test ckpts.
+    unet_sd, refiner_sd = load_upsr_state(ckpt_path, unet=unet, refiner=refiner, device=str(device))
+    unet.load_state_dict(unet_sd, strict=False)
+    refiner.load_state_dict(refiner_sd, strict=False)
 
-    ddim = build_ddim(mcfg).to(device)
+    if args.sampler == "dpm++":
+        sampler = build_dpm_solver(mcfg).to(device)
+    else:
+        sampler = build_ddim(mcfg).to(device)
+
     steps = args.steps or (icfg.get("fast_steps", 10) if args.fast
                            else mcfg["scheduler"].get("infer_steps", 30))
 
-    lr = _load_image(args.inp)
-    print(f"[upscale-sr] LR {tuple(lr.shape)} → {args.scale}× | {steps} steps | tiling crop={args.crop}")
+    lr = load_image_pil(Image.open(args.inp))
+    print(f"[upscale-sr] LR {tuple(lr.shape)} → {args.scale}× | {steps} steps ({args.sampler}) | tiling crop={args.crop}")
     t0 = time.perf_counter()
     with torch.no_grad():
         with torch.autocast("cuda", dtype=torch.bfloat16) if device.type == "cuda" else nullcontext():
-            hr = upscale(lr, unet, refiner, vae, ddim, device,
+            hr = upscale(lr, unet, refiner, vae, sampler, device,
                          scale=args.scale, steps=steps, crop=args.crop)
     dt = time.perf_counter() - t0
     _save_image(hr, args.out)

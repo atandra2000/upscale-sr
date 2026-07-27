@@ -46,3 +46,4 @@ outputs/
 # Sample / demo outputs
 samples/
 *.log
+pytest-of-atandra2000/

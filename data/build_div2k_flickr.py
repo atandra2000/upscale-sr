@@ -1,38 +1,20 @@
-"""Download DIV2K + Flickr2K + DF2K HR images → webdataset shards (or flat dir).
+"""Download DIV2K + Flickr2K + DF2K HR images → webdataset shards or flat dir.
 
-Canonical SR training data (DESIGN §3):
-  * DIV2K   — 800 train + 100 val (high-quality 2K photos)
-  * Flickr2K — 2 K HR images
-  * DF2K    — OST + DIV2K + Flickr2K-derived 3.5 K HR set
-
-This script is idempotent and resumable.  It writes:
-  * ``<out>/HR-######.tar`` webdataset shards (~200 images/shard) when
-    ``--backend webdataset`` (default on RunPod), OR
-  * ``<out>/hr/`` flat directory of ``.png`` files when ``--backend flat``
-    (local / smoke tests, no webdataset dep).
-
-A ``manifest.json`` with the total HR count is written alongside the shards
-so the loader knows the dataset length without scanning every tar.
-
-Usage:
-    python data/build_div2k_flickr.py --out /workspace/data/sr \
-        --backend webdataset --shard-size 200
-    python data/build_div2k_flickr.py --out /tmp/sr_local --backend flat  # smoke
+Idempotent + resumable.  Writes ``<out>/HR-######.tar`` shards (webdataset
+backend) or ``<out>/hr/`` flat PNGs (flat backend), plus a ``manifest.json``
+with the HR count.
 """
 from __future__ import annotations
 
 import argparse
 import io
 import json
-import os
-import shutil
 import tarfile
 import urllib.request
 from pathlib import Path
 
 from PIL import Image
 
-# ── Dataset source URLs (canonical, public) ─────────────────────────────────
 SOURCES = {
     # DIV2K train + val (HTQ high-quality split, ~2K photos)
     "div2k_train": {
@@ -60,8 +42,7 @@ def _download(url: str, dst: Path) -> None:
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     print(f"  fetching {url} → {dst}")
-    with urllib.request.urlopen(url, timeout=120) as r, open(dst, "wb") as f:
-        shutil.copyfileobj(r, f)
+    urllib.request.urlretrieve(url, dst)
 
 
 def _extract(archive: Path, out_dir: Path) -> Path:
