@@ -33,8 +33,8 @@ def build_pipeline(cfg, ckpt_path, device, stub_vae=False):
     sd = load_file(ckpt_path, device=str(device))
     mcfg = cfg["model"]
     if stub_vae:
-        from training.train import _StubVAE
-        vae = _StubVAE().to(device)
+        from utils.stubs import StubVAE
+        vae = StubVAE().to(device)
     else:
         vae = load_frozen_vae(mcfg, device)
     unet = build_sr_unet(mcfg).to(device).eval()

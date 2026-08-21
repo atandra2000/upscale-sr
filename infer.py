@@ -156,8 +156,8 @@ def main():
     ckpt_path = args.ckpt or icfg.get("ckpt", "sr_x4_final.safetensors")
     print(f"[upscale-sr] device={device} | ckpt={ckpt_path} | sampler={args.sampler}")
     if args.stub_vae:
-        from training.train import _StubVAE
-        vae = _StubVAE().to(device)
+        from utils.stubs import StubVAE
+        vae = StubVAE().to(device)
     else:
         vae = load_frozen_vae(mcfg, device)
     unet = build_sr_unet(mcfg).to(device).eval()

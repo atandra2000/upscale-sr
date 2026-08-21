@@ -14,12 +14,11 @@ from infer import upscale
 from models.sr_unet import SRUNet
 from models.ssm_refiner import SSMRefiner
 from models.scheduler import DDIMScheduler
-from training.train import _StubVAE
+from utils.stubs import StubVAE
 from utils.config import load_config
 
-
 def _pipeline(device, scale=4):
-    vae = _StubVAE().to(device)
+    vae = StubVAE().to(device)
     unet = SRUNet(in_ch=9, out_ch=4, base_ch=64, ch_mults=(1, 2, 4),
                  res_blks=1, attn_levels=(1, 2), heads=8, t_dim=64,
                  grad_ckpt=False).to(device).eval()
