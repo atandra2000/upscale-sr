@@ -17,6 +17,23 @@ import torch
 from safetensors.torch import load_file, save_file
 
 
+def load_torch_state(path: str, device: str = "cpu"):
+    """``torch.load`` that prefers ``weights_only=True`` (safe) and only falls
+    back to full pickle when the payload genuinely contains non-tensor objects
+    (optimizer/scheduler/EMA/RNG state).  A full-pickle fallback logs a warning:
+    the file is being unpickled, so only load files you trust.
+    """
+    try:
+        return torch.load(str(path), map_location=device, weights_only=True)
+    except Exception:
+        import logging
+        logging.getLogger("upscale-sr").warning(
+            f"torch.load({path}) needs full pickle (non-tensor objects). "
+            "Only load checkpoints from trusted sources — pickles can run "
+            "arbitrary code.")
+        return torch.load(str(path), map_location=device, weights_only=False)
+
+
 def rng_state_dict() -> dict:
     """Capture the full RNG state for perfect resumption."""
     return {
@@ -26,7 +43,6 @@ def rng_state_dict() -> dict:
         "torch_cuda": (torch.cuda.get_rng_state_all()
                        if torch.cuda.is_available() else None),
     }
-
 
 def restore_rng_state(state: dict) -> None:
     random.setstate(state["python"])
@@ -138,7 +154,7 @@ class CheckpointManager:
 
         state_path = self.save_dir / f"sr_step_{step:07d}.state.pt"
         if state_path.exists():
-            state = torch.load(str(state_path), map_location=device, weights_only=False)
+            state = load_torch_state(state_path, device=device)
             try:
                 optimizer.load_state_dict(state["optimizer"])
             except Exception:
@@ -167,7 +183,7 @@ def load_sd_epoch42_weights(unet: torch.nn.Module, ckpt_path: str, device: str =
     if path.suffix == ".safetensors":
         raw_sd = load_file(str(path), device=str(device))
     else:
-        loaded = torch.load(str(path), map_location=device, weights_only=False)
+        loaded = load_torch_state(str(path), device=device)
         raw_sd = loaded.get("state_dict", loaded.get("unet", loaded.get("model", loaded)))
 
     sd = {}

@@ -20,7 +20,8 @@ def _swap_ema(unet, refiner, state_path, device):
     """Apply EMA shadow weights from the training state.pt into the modules."""
     if state_path is None or not state_path.exists():
         return False
-    state = torch.load(str(state_path), map_location=device, weights_only=False)
+    from utils.checkpoint import load_torch_state
+    state = load_torch_state(str(state_path), device=str(device))
     ema_state = state.get("ema")
     if ema_state is None:
         return False
