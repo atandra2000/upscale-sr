@@ -92,7 +92,7 @@ train:
   compile:
     enabled: true
     mode: max-autotune        # compile U-Net + refiner; DDIM step loop stays eager
-  cuda_graphs: true           # capture fixed-shape step after warmup
+
   ckpt:
     every_iters: 10000
     keep_last: 6

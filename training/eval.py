@@ -29,14 +29,14 @@ def _psnr(x: torch.Tensor, y: torch.Tensor, data_range: float = 1.0) -> float:
 
 
 @torch.no_grad()
-def _sr_inference(model, ddim, lr, device, steps=30):
+def _sr_inference(model, ddim, lr, device, scale=4, steps=30):
     """Run DDIM+refiner on one LR batch → HR image (B,3,H,W) in [0,1]."""
     vae = model["vae"]
     unet = model["unet_compiled"]
     refiner = model["refiner_compiled"]
     lr01 = (lr + 1) / 2                                       # [0,1]
     lr_lat = vae.encode(lr01)                                 # (B,4,h/8,w/8)
-    H, W = lr.shape[-2] * 4, lr.shape[-1] * 4                  # 4× upscale
+    H, W = lr.shape[-2] * scale, lr.shape[-1] * scale
     Hl, Wl = H // 8, W // 8
 
     # start from noise at the HR latent size
@@ -57,6 +57,7 @@ def evaluate(model, cfg, device, ema_unet=None, ema_refiner=None,
              max_imgs=20, steps=None):
     """Run DDIM+refiner on the val set, return mean PSNR / LPIPS."""
     ddim = build_ddim(cfg["model"]).to(device)
+    scale = int(cfg.get("data", cfg).get("scale", 4))
     steps = steps or cfg["model"]["scheduler"].get("infer_steps", 30)
     val_ds = build_val_dataset(cfg)
     if len(val_ds) == 0:
@@ -73,7 +74,7 @@ def evaluate(model, cfg, device, ema_unet=None, ema_refiner=None,
             s = val_ds[i]
             lr = s["lr"].unsqueeze(0).to(device)
             hr01 = ((s["hr"] + 1) / 2).unsqueeze(0).to(device)
-            out = _sr_inference(model, ddim, lr, device, steps=steps)
+            out = _sr_inference(model, ddim, lr, device, scale=scale, steps=steps)
             H = min(out.shape[-2], hr01.shape[-2])
             W = min(out.shape[-1], hr01.shape[-1])
             psnrs.append(_psnr(out[..., :H, :W], hr01[..., :H, :W]))

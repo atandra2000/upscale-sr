@@ -26,6 +26,7 @@ from utils.memory import gpu_vram_gb, apply_channels_last
 from utils.schedule import build_schedule
 from utils.stability import EMA, clip_and_guard
 from utils.checkpoint import CheckpointManager, load_sd_epoch42_weights
+from utils.stubs import StubVAE, StubDataset
 from utils.losses import build_lpips, lpips_loss_fn, ssim_loss
 from models import (build_sr_unet, build_ssm_refiner, build_ddpm, build_ddim,
                      sr_cond_input)
@@ -63,37 +64,11 @@ def _autocast(device: torch.device):
     return nullcontext()
 
 
-class _StubVAE(nn.Module):
-    """A no-op VAE stand-in: 8× bilinear downsample / upsample, fixed scale.
-    Used only by ``--stub-vae`` so the training loop can be smoke-tested on a
-    machine without the SD VAE weights. NOT for real training."""
-
-    SCALE_FACTOR = 0.18215
-
-    def __init__(self):
-        super().__init__()
-        self.scale_factor = self.SCALE_FACTOR
-        self.dtype = torch.float32
-
-    @torch.no_grad()
-    def encode(self, x):
-        # (B,3,H,W) → (B,4,H/8,W/8) pseudo-latent (channel-split+pad)
-        d = F.avg_pool2d(x, 8)
-        pad = 4 - d.shape[1]
-        if pad > 0:
-            d = F.pad(d, (0, 0, 0, 0, 0, pad))
-        return d[:, :4] * self.scale_factor
-
-    @torch.no_grad()
-    def decode(self, z):
-        z = z / self.scale_factor
-        return F.interpolate(z[:, :3], scale_factor=8, mode="bilinear",
-                             align_corners=False)
 
 
 def load_vae(cfg: dict, device, stub: bool = False):
     if stub:
-        return _StubVAE().to(device)
+        return StubVAE().to(device)
     vae_cfg = cfg.get("model", cfg).get("vae", {})
     vae = FrozenVAE(
         model_id=vae_cfg.get("model_id", "stabilityai/sd-vae-ft-mse"),
@@ -147,6 +122,9 @@ def train_step(
         if lcfg.get("p2", True):
             ac = ddpm.alphas_cumprod.to(device)[t].clamp(min=1e-6, max=1.0 - 1e-6)
             p2_w = (1.0 - ac).pow(2) / ac
+            # Clamp: at t≈T (ᾱ→1e-6) the raw P2 weight hits ~1e6, which can
+            # spike gradients.  Cap at 100× the mean-weight scale.
+            p2_w = p2_w.clamp(max=100.0)
             mse = (mse_per_sample * p2_w).mean()
         else:
             mse = mse_per_sample.mean()
@@ -160,8 +138,9 @@ def train_step(
             img_pred = model["vae"].decode(x0_pred)         # (B,3,H,W) [-1,1]
 
     if lcfg.get("unet_lpips", 0.1) > 0 and lpips_fn is not None:
-        img_pred_01 = (img_pred + 1) / 2
-        lp = lpips_loss_fn(lpips_fn, img_pred_01, hr_01)
+        # lpips.LPIPS and the VGG fallback both expect [-1,1]; img_pred and hr
+        # are already in [-1,1] from the VAE decode and dataset respectively.
+        lp = lpips_loss_fn(lpips_fn, img_pred, hr)
         unet_loss = unet_loss + lcfg["unet_lpips"] * lp
     else:
         lp = torch.tensor(0.0, device=device)
@@ -265,7 +244,11 @@ def main(rank_i: int, world_size: int, args):
     if not args.no_resume:
         try:
             resume = ckpt_mgr.load(unet, refiner, optimizer, scheduler,
-                                   ema=None, device=str(device))
+                                   ema=ema_unet, device=str(device))
+            # Refiner EMA is stored in extra_meta (separate from the main EMA slot).
+            ref_ema_meta = resume.get("meta", {}).get("refiner_ema")
+            if ref_ema_meta is not None:
+                ema_refiner.load_state_dict(ref_ema_meta, device=device)
             logger.info(f"resumed from step {resume.get('step', 0)}")
         except Exception as e:
             logger.warning(f"resume skipped: {e}")
@@ -276,13 +259,18 @@ def main(rank_i: int, world_size: int, args):
             logger.info(f"Loaded {n_loaded}/{n_total} weights from pretrained SD checkpoint: {args.pretrained_sd}")
         except Exception as e:
             logger.error(f"Failed to load pretrained SD weights from {args.pretrained_sd}: {e}")
-
     # ── DDP wrap ────────────────────────────────────────────────────────────
+    # The refiner's forward is skipped while its loss weight is 0 (warmup),
+    # so those parameters see no gradients and DDP must be told about it.
+    # Once warmup is over the refiner always runs → plain (fast) DDP.
+    refiner_warmup = (args.refiner_warmup if args.refiner_warmup is not None
+                      else tcfg.get("refiner_warmup_iters", 10000))
     if not args.stub:
         ddp_unet = DDP(unet, device_ids=[rank_i], output_device=rank_i,
                        find_unused_parameters=False, gradient_as_bucket_view=True)
         ddp_refiner = DDP(refiner, device_ids=[rank_i], output_device=rank_i,
-                          find_unused_parameters=True, gradient_as_bucket_view=True)
+                          find_unused_parameters=(refiner_warmup > 0),
+                          gradient_as_bucket_view=True)
     else:
         ddp_unet, ddp_refiner = unet, refiner
     # unet_compiled / refiner_compiled are the canonical forward handles; the
@@ -316,7 +304,7 @@ def main(rank_i: int, world_size: int, args):
     from data.sr_dataset import build_train_dataset, SRDistributedSampler
     if args.stub:
         # tiny synthetic dataset for the smoke run (no real HR images needed)
-        train_ds = _StubDataset(n=16, patch_hr=64, scale=cfg["data"].get("scale", 4))
+        train_ds = StubDataset(n=16, patch_hr=64, scale=cfg["data"].get("scale", 4))
     else:
         train_ds = build_train_dataset(cfg)
     sampler = None
@@ -339,11 +327,11 @@ def main(rank_i: int, world_size: int, args):
     log_every = tcfg.get("log_every", 50)
     ckpt_every = tcfg["ckpt"]["every_iters"]
     eval_every = tcfg.get("eval", {}).get("every_iters", 10000)
-    refiner_warmup = args.refiner_warmup if args.refiner_warmup is not None else tcfg.get("refiner_warmup_iters", 10000)
 
     global_step = resume.get("step", 0)
     best_loss = resume.get("best_loss", float("inf"))
     optimizer.zero_grad(set_to_none=True)
+    grad_norm = 0.0
     t0 = time.perf_counter()
 
     logger.info(f"starting training: total_iters={total_iters} | grad_accum={grad_accum} | refiner_warmup={refiner_warmup}")
@@ -356,9 +344,8 @@ def main(rank_i: int, world_size: int, args):
                 sampler.set_epoch(it)
             data_iter = iter(loader)
             batch = next(data_iter)
-
         backward_loss, ldict = train_step(
-            batch, model, ddpm, lpips_fn, cfg, device, refiner_warmup, it)
+            batch, model, ddpm, lpips_fn, cfg, device, refiner_warmup, global_step)
         backward_loss.backward()
 
         if it % grad_accum == 0:
@@ -397,6 +384,11 @@ def main(rank_i: int, world_size: int, args):
             metrics = evaluate(model, cfg, device, ema_unet, ema_refiner,
                                max_imgs=args.eval_imgs)
             logger.info(f"[eval @ {it}] " + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+            # Track the best eval metric (LPIPS, lower = better) so the
+            # checkpoint carries a meaningful "best_loss" for resume/early-stop.
+            if metrics.get("n", 0) > 0 and metrics.get("lpips", float("inf")) < best_loss:
+                best_loss = metrics["lpips"]
+                logger.info(f"[eval @ {it}] new best LPIPS {best_loss:.4f}")
 
     # ── final checkpoint ────────────────────────────────────────────────────
     if is_main_process():
@@ -408,18 +400,6 @@ def main(rank_i: int, world_size: int, args):
         cleanup_ddp()
 
 
-class _StubDataset(torch.utils.data.Dataset):
-    def __init__(self, n=16, patch_hr=128, scale=4):
-        self.n, self.patch_hr, self.scale = n, patch_hr, scale
-
-    def __len__(self):
-        return self.n
-
-    def __getitem__(self, idx):
-        hr = torch.rand(3, self.patch_hr, self.patch_hr) * 2 - 1     # [-1,1]
-        lr = F.interpolate(hr.unsqueeze(0), scale_factor=1 / self.scale,
-                            mode="bicubic", align_corners=False).squeeze(0)
-        return {"lr": lr.clamp(-1, 1), "hr": hr, "seed": idx}
 
 
 def _argparser():
