@@ -161,34 +161,50 @@ class RealESRGANDegrader:
         sigma1 = rng.uniform(*self.blur_sigma)
         img = _gaussian_blur(img, sigma1)
 
-        order = [1, 2, 3, 4]  # 1=resize, 2=noise, 3=jpeg, 4=sinc
+        # Stage-order shuffle (Real-ESRGAN "second-order" degradation).
+        # When shuffle_prob hits, the four stages are reordered; otherwise
+        # they run in the canonical order: resize → noise → JPEG → sinc.
+        stages = [
+            (1, lambda: self._stage_resize(img, rng)),
+            (2, lambda: self._stage_noise(img, rng)),
+            (3, lambda: self._stage_jpeg(img, rng)),
+            (4, lambda: self._stage_sinc(img, rng)),
+        ]
         if rng.random() < self.shuffle_prob:
-            rng.shuffle(order)
+            rng.shuffle(stages)
             second_blur = rng.random() < self.second_blur_prob
         else:
             second_blur = False
-
-        if rng.random() < self.resize_prob:
-            scale = rng.uniform(0.15, 1.5)
-            img = _resize_stage(img, rng, scale)
-
-        sigma_n = rng.uniform(*self.noise_sigma)
-        poisson = rng.random() < 0.5
-        img = _add_noise(img, sigma_n / 255.0, poisson, rng)
-
-        q = rng.randint(*self.jpeg_quality)
-        img = _jpeg_compress(img, q)
+        for _, fn in stages:
+            img = fn()
 
         if second_blur:
             sx = rng.uniform(*self.blur_sigma)
             sy = rng.uniform(*self.blur_sigma)
             img = _aniso_blur(img, sx, sy)
 
+        return img.clamp(0, 1)
+
+    def _stage_resize(self, img: torch.Tensor, rng: random.Random) -> torch.Tensor:
+        if rng.random() < self.resize_prob:
+            scale = rng.uniform(0.15, 1.5)
+            return _resize_stage(img, rng, scale)
+        return img
+
+    def _stage_noise(self, img: torch.Tensor, rng: random.Random) -> torch.Tensor:
+        sigma_n = rng.uniform(*self.noise_sigma)
+        poisson = rng.random() < 0.5
+        return _add_noise(img, sigma_n / 255.0, poisson, rng)
+
+    def _stage_jpeg(self, img: torch.Tensor, rng: random.Random) -> torch.Tensor:
+        q = rng.randint(*self.jpeg_quality)
+        return _jpeg_compress(img, q)
+
+    def _stage_sinc(self, img: torch.Tensor, rng: random.Random) -> torch.Tensor:
         if rng.random() < self.sinc_prob:
             cutoff = rng.uniform(0.6, 0.99)
-            img = _sinc_filter(img, cutoff)
-
-        return img.clamp(0, 1)
+            return _sinc_filter(img, cutoff)
+        return img
 
 
 def make_lr_pair(hr_patch: torch.Tensor, degrader: RealESRGANDegrader,

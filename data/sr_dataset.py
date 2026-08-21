@@ -69,8 +69,8 @@ class SRDataset(Dataset):
         _, _, H, W = hr.shape
         if self.mode == "val":
             s = self.scale
-            ch = (H // s) * s if H >= s else s
-            cw = (W // s) * s if W >= s else s
+            ch = min((H // s) * s, H) if H >= s else H
+            cw = min((W // s) * s, W) if W >= s else W
             top = (H - ch) // 2
             left = (W - cw) // 2
             return hr[:, :, top:top + ch, left:left + cw]

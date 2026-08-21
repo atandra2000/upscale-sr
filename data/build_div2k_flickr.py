@@ -18,16 +18,16 @@ from PIL import Image
 SOURCES = {
     # DIV2K train + val (HTQ high-quality split, ~2K photos)
     "div2k_train": {
-        "url": "http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip",
+        "url": "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip",
         "subdir": "DIV2K_train_HR",
     },
     "div2k_val": {
-        "url": "http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip",
+        "url": "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip",
         "subdir": "DIV2K_valid_HR",
     },
     # Flickr2K — distributed as a zip of HR JPEGs (legacy CVL mirror)
     "flickr2k": {
-        "url": "http://cv.snu.ac.kr/research/EDSR/Flickr2K.tar",
+        "url": "https://cv.snu.ac.kr/research/EDSR/Flickr2K.tar",
         "subdir": "Flickr2K_HR",
     },
 }
