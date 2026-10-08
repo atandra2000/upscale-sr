@@ -207,9 +207,8 @@ Spawn via the Agent tool when the trigger matches (root `AGENTS.md §2`):
 | `project-finder` | "which file owns the SSM scan?", "where is the conditioning concat?" |
 | `research-engineer-dev` | (only if extending the platform itself — not this project) |
 
-> For architecture / attention / scan / memory-layout questions, prefer the
-> `.agents/skills/llm-architecture` and `computer-vision-multimodal` skills
-> and `generative-vision-gans-vaes` over re-deriving from scratch.
+> For architecture / attention / scan / memory-layout questions, prefer each
+> project's own architecture docs over re-deriving from scratch.
 
 ---
 

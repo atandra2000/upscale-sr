@@ -47,3 +47,6 @@ outputs/
 samples/
 *.log
 pytest-of-atandra2000/
+
+# codegraph index (binary, local only)
+.codegraph/
