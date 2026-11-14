@@ -74,19 +74,30 @@ def _sinc_filter(img: torch.Tensor, cutoff: float, kernel_size: int = 21) -> tor
 
 
 def _jpeg_compress(img: torch.Tensor, quality: int) -> torch.Tensor:
-    """JPEG compress a (B,3,H,W) [0,1] tensor → (B,3,H,W) [0,1] via torchvision.
-
-    # ponytail: per-image round-trip; torchvision.io.encode_jpeg is the GPU-side
-    # upgrade path if JPEG becomes the dataloader bottleneck.
-    """
-    from torchvision.io import encode_jpeg, decode_jpeg
-    out = []
-    for b in range(img.shape[0]):
-        arr = (img[b].clamp(0, 1) * 255).round().to(torch.uint8)
-        enc = encode_jpeg(arr, int(quality))
-        dec = decode_jpeg(enc).to(img.dtype) / 255.0
-        out.append(dec.to(img.device, img.dtype))
-    return torch.stack(out, dim=0)
+    """JPEG compress a (B,3,H,W) [0,1] tensor → (B,3,H,W) [0,1] via torchvision or PIL fallback."""
+    try:
+        from torchvision.io import encode_jpeg, decode_jpeg
+        out = []
+        for b in range(img.shape[0]):
+            arr = (img[b].clamp(0, 1) * 255).round().to(torch.uint8)
+            enc = encode_jpeg(arr, int(quality))
+            dec = decode_jpeg(enc).to(img.dtype) / 255.0
+            out.append(dec.to(img.device, img.dtype))
+        return torch.stack(out, dim=0)
+    except ImportError:
+        import io
+        import numpy as np
+        from PIL import Image
+        out = []
+        for b in range(img.shape[0]):
+            arr = (img[b].clamp(0, 1) * 255).round().to(torch.uint8).cpu().permute(1, 2, 0).numpy()
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, format="JPEG", quality=int(quality))
+            buf.seek(0)
+            dec = np.array(Image.open(buf), dtype=np.float32) / 255.0
+            dec_t = torch.from_numpy(dec).permute(2, 0, 1).to(img.device, img.dtype)
+            out.append(dec_t)
+        return torch.stack(out, dim=0)
 
 
 def _add_noise(img: torch.Tensor, sigma: float, poisson: bool, rng) -> torch.Tensor:
@@ -95,7 +106,7 @@ def _add_noise(img: torch.Tensor, sigma: float, poisson: bool, rng) -> torch.Ten
         return img
     if poisson:
         lam = max(1e-3, sigma * sigma)
-        noisy = torch.poisson(img * lam) / lam
+        noisy = torch.poisson(img.clamp(min=0.0) * lam) / lam
         return noisy.clamp(0, 1)
     return (img + torch.randn_like(img) * sigma).clamp(0, 1)
 
